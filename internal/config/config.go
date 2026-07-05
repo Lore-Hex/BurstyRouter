@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +22,9 @@ const (
 	envLocalMaxConcurrency = "BURSTY_LOCAL_MAX_CONCURRENCY"
 	envLocalQueueWait      = "BURSTY_LOCAL_QUEUE_WAIT"
 	envBurstOnError        = "BURSTY_BURST_ON_ERROR"
+	envBurstFallbackModel  = "BURSTY_BURST_FALLBACK_MODEL"
 	envToken               = "BURSTY_TOKEN"
+	envAliases             = "BURSTY_ALIASES"
 )
 
 // DefaultTRCatalogURL is the public TrustedRouter control-plane catalog base URL.
@@ -37,7 +40,9 @@ type Config struct {
 	LocalMaxConcurrency int
 	LocalQueueWait      time.Duration
 	BurstOnError        bool
+	BurstFallbackModel  string
 	Token               string
+	Aliases             map[string]string
 }
 
 // HasLocal reports whether local upstream routing is configured.
@@ -68,7 +73,9 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 	fs.IntVar(&cfg.LocalMaxConcurrency, "local-max-concurrency", cfg.LocalMaxConcurrency, "in-flight cap on local upstream")
 	fs.DurationVar(&cfg.LocalQueueWait, "local-queue-wait", cfg.LocalQueueWait, "how long to wait for a local slot before bursting")
 	fs.BoolVar(&cfg.BurstOnError, "burst-on-error", cfg.BurstOnError, "burst to TrustedRouter on local connect error/timeout/429/5xx/404-model")
+	fs.StringVar(&cfg.BurstFallbackModel, "burst-fallback-model", cfg.BurstFallbackModel, "TrustedRouter model to use when bursting an unmapped local-native model")
 	fs.StringVar(&cfg.Token, "token", cfg.Token, "optional inbound bearer token")
+	fs.Var(aliasMapValue{values: cfg.Aliases}, "alias", "model alias CLOUD-id=LOCAL-model; repeatable")
 	fs.Usage = func() {
 		fmt.Fprintln(output, "Usage: burstyrouter [flags]")
 		fmt.Fprintln(output)
@@ -81,7 +88,9 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 		fmt.Fprintln(output, "  -local-max-concurrency     env BURSTY_LOCAL_MAX_CONCURRENCY   default 4")
 		fmt.Fprintln(output, "  -local-queue-wait          env BURSTY_LOCAL_QUEUE_WAIT        default 0s")
 		fmt.Fprintln(output, "  -burst-on-error            env BURSTY_BURST_ON_ERROR          default true")
+		fmt.Fprintln(output, "  -burst-fallback-model      env BURSTY_BURST_FALLBACK_MODEL    default \"\"")
 		fmt.Fprintln(output, "  -token                     env BURSTY_TOKEN                   default \"\"")
+		fmt.Fprintln(output, "  -alias                     env BURSTY_ALIASES                 default \"\"")
 	}
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -100,6 +109,7 @@ func defaultsFromEnv(lookupEnv func(string) (string, bool)) (Config, error) {
 		LocalMaxConcurrency: 4,
 		LocalQueueWait:      0,
 		BurstOnError:        true,
+		Aliases:             map[string]string{},
 	}
 
 	if value, ok := lookupEnv(envListen); ok {
@@ -138,8 +148,16 @@ func defaultsFromEnv(lookupEnv func(string) (string, bool)) (Config, error) {
 		}
 		cfg.BurstOnError = parsed
 	}
+	if value, ok := lookupEnv(envBurstFallbackModel); ok {
+		cfg.BurstFallbackModel = value
+	}
 	if value, ok := lookupEnv(envToken); ok {
 		cfg.Token = value
+	}
+	if value, ok := lookupEnv(envAliases); ok {
+		if err := parseAliasList(value, cfg.Aliases); err != nil {
+			return Config{}, fmt.Errorf("%s: %w", envAliases, err)
+		}
 	}
 
 	return cfg, nil
@@ -159,4 +177,63 @@ func validate(cfg Config) error {
 		return errors.New("-local-queue-wait must not be negative")
 	}
 	return nil
+}
+
+type aliasMapValue struct {
+	values map[string]string
+}
+
+func (v aliasMapValue) String() string {
+	if len(v.values) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(v.values))
+	for key := range v.values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+v.values[key])
+	}
+	return strings.Join(parts, ",")
+}
+
+func (v aliasMapValue) Set(value string) error {
+	from, to, err := parseAliasPair(value)
+	if err != nil {
+		return err
+	}
+	if _, ok := v.values[from]; ok {
+		return fmt.Errorf("duplicate alias %q", from)
+	}
+	v.values[from] = to
+	return nil
+}
+
+func parseAliasList(value string, aliases map[string]string) error {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parser := aliasMapValue{values: aliases}
+	for _, part := range strings.Split(value, ",") {
+		if err := parser.Set(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseAliasPair(value string) (string, string, error) {
+	value = strings.TrimSpace(value)
+	if strings.Count(value, "=") != 1 {
+		return "", "", fmt.Errorf("alias %q must have from=to shape", value)
+	}
+	from, to, _ := strings.Cut(value, "=")
+	from = strings.TrimSpace(from)
+	to = strings.TrimSpace(to)
+	if from == "" || to == "" {
+		return "", "", fmt.Errorf("alias %q must have non-empty from and to", value)
+	}
+	return from, to, nil
 }

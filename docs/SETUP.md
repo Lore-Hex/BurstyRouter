@@ -29,6 +29,16 @@ export TRUSTEDROUTER_API_KEY="tr_..."
 burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY"
 ```
 
+Local plus aliases for tool-facing cloud model names:
+
+```bash
+export TRUSTEDROUTER_API_KEY="tr_..."
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -alias gpt-4o=llama3.2 \
+  -alias anthropic/claude-haiku-4.5=qwen2.5-coder:32b
+```
+
 TrustedRouter-only:
 
 ```bash
@@ -42,6 +52,8 @@ If the proxy is reachable from the internet, require a bearer token:
 export BURSTY_TOKEN="$(openssl rand -hex 24)"
 burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY" -token "$BURSTY_TOKEN"
 ```
+
+Clients may authenticate with either `Authorization: Bearer $BURSTY_TOKEN` or `x-api-key: $BURSTY_TOKEN`.
 
 ## 3. Verify
 
@@ -77,6 +89,29 @@ curl -is "$BURSTY_HOST/v1/chat/completions" \
   -d '{"model":"local/llama3.2","messages":[{"role":"user","content":"ping"}]}' \
   | awk 'BEGIN{found=0} /^X-Bursty-Route:/ {print; found=1} END{exit found?0:1}'
 ```
+
+With `x-api-key`:
+
+```bash
+curl -is "$BURSTY_HOST/v1/chat/completions" \
+  -H "x-api-key: $BURSTY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"ping"}]}' \
+  | awk 'BEGIN{found=0} /^X-Bursty-Route:/ {print; found=1} END{exit found?0:1}'
+```
+
+## 3a. Burst To Another OpenAI-Compatible Cloud
+
+TrustedRouter is the default burst target, but `-tr-base-url` may point at any bearer-keyed OpenAI-compatible `/v1` base URL.
+
+```bash
+export TRUSTEDROUTER_API_KEY="<upstream bearer token>"
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -tr-base-url "https://openrouter.ai/api/v1"
+```
+
+Savings/pricing features are TrustedRouter-specific. If the configured burst upstream lacks `/v1/messages` or `/v1/responses`, BurstyRouter returns a clean `501 endpoint_not_supported` envelope for those passthrough endpoints.
 
 ## 4. Expose With Ngrok
 
@@ -116,6 +151,12 @@ API key: $BURSTY_TOKEN, or any string when BURSTY_TOKEN is unset
 Models: local/llama3.2, anthropic/claude-haiku-4.5
 ```
 
+With aliases, list the cloud-facing alias ids instead:
+
+```text
+Models: gpt-4o, anthropic/claude-haiku-4.5
+```
+
 Verify with a chat request:
 
 ```bash
@@ -135,11 +176,13 @@ export ANTHROPIC_BASE_URL="https://<host>"
 export ANTHROPIC_API_KEY="${BURSTY_TOKEN:-any-string}"
 ```
 
+Anthropic-family clients send `x-api-key`; BurstyRouter accepts it when `BURSTY_TOKEN` is set.
+
 Verify:
 
 ```bash
 curl -is "https://<host>/v1/messages" \
-  -H "Authorization: Bearer $BURSTY_TOKEN" \
+  -H "x-api-key: $BURSTY_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}' \
   | awk 'BEGIN{found=0} /^X-Bursty-Route:/ {print; found=1} END{exit found?0:1}'
@@ -173,7 +216,7 @@ curl -is "https://<host>/v1/chat/completions" \
 ```text
 Base URL: https://<host>/v1
 API key: $BURSTY_TOKEN, or any string when BURSTY_TOKEN is unset
-Model: local/<local-model> or a TrustedRouter model
+Model: local/<local-model>, an alias id such as gpt-4o, or a TrustedRouter model
 ```
 
 ## 6. Routing Cheatsheet
@@ -194,6 +237,20 @@ Force TrustedRouter:
 
 ```json
 {"model":"anthropic/claude-haiku-4.5","provider":{"order":["anthropic"]},"messages":[{"role":"user","content":"ping"}]}
+```
+
+Alias cloud id to local model:
+
+```bash
+burstyrouter -local-url http://127.0.0.1:11434 -alias gpt-4o=llama3.2
+```
+
+Allow unmapped local-native ids to burst with a fallback model:
+
+```bash
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -burst-fallback-model openai/gpt-4o-mini
 ```
 
 Read routing:

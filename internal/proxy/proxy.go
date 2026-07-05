@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -196,7 +197,10 @@ func (s *Server) handleLocalCapable(w http.ResponseWriter, r *http.Request, endp
 		writeRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusBadRequest, "invalid_request_body", err.Error(), "invalid_request_error")
 		return
 	}
-	decision, err := policy.Decide(raw, s.local != nil, s.tr != nil)
+	decision, err := policy.Decide(raw, s.local != nil, s.tr != nil, policy.Options{
+		Aliases:            s.cfg.Aliases,
+		BurstFallbackModel: s.cfg.BurstFallbackModel,
+	})
 	if err != nil {
 		var configErr *policy.ConfigError
 		if errors.As(err, &configErr) {
@@ -241,9 +245,12 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 		return
 	case localSlotFull:
 		if !forced && s.tr != nil {
-			s.stats.burstsFull.Add(1)
-			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstFull, endpoint.family)
-			return
+			if decision.BurstAllowed {
+				s.stats.burstsFull.Add(1)
+				s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstFull, endpoint.family)
+				return
+			}
+			s.countSkippedUnmapped(decision)
 		}
 		w.Header().Set("Retry-After", "1")
 		writeRoutedError(w, policy.RouteLocal, policy.ReasonBurstFull, http.StatusTooManyRequests, "local_overloaded", "local upstream is full", "rate_limit_error")
@@ -259,10 +266,13 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 	resp, err := endpoint.localPost(r.Context(), decision.LocalBody, r.Header)
 	if err != nil {
 		if !forced && s.cfg.BurstOnError && s.tr != nil {
-			s.stats.burstsError.Add(1)
-			releaseLocalSlot()
-			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
-			return
+			if decision.BurstAllowed {
+				s.stats.burstsError.Add(1)
+				releaseLocalSlot()
+				s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
+				return
+			}
+			s.countSkippedUnmapped(decision)
 		}
 		writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", err.Error(), "api_error")
 		return
@@ -275,11 +285,14 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 		return
 	}
 	if shouldBurst && !forced && s.cfg.BurstOnError && s.tr != nil {
-		s.stats.burstsError.Add(1)
-		closeBurstResponseBody(resp)
-		releaseLocalSlot()
-		s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
-		return
+		if decision.BurstAllowed {
+			s.stats.burstsError.Add(1)
+			closeBurstResponseBody(resp)
+			releaseLocalSlot()
+			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
+			return
+		}
+		s.countSkippedUnmapped(decision)
 	}
 	if shouldBurst && forced {
 		closeBurstResponseBody(resp)
@@ -298,11 +311,20 @@ func (s *Server) serveTrustedRouterRaw(w http.ResponseWriter, r *http.Request, p
 	}
 	resp, err := s.tr.RawPost(r.Context(), path, body, r.Header)
 	if err != nil {
+		if passthroughEndpointNotFound(endpoint, err) {
+			writePassthroughUnsupported(w, r.URL.Path, reason)
+			return
+		}
 		status, message := trustedRouterError(err)
 		writeRoutedError(w, policy.RouteTrustedRouter, reason, status, "trustedrouter_upstream_error", message, "api_error")
 		return
 	}
 	defer resp.Body.Close()
+	if isTrustedRouterOnlyEndpoint(endpoint) && resp.StatusCode == http.StatusNotFound {
+		drainAndClose(resp.Body)
+		writePassthroughUnsupported(w, r.URL.Path, reason)
+		return
+	}
 	s.serveUpstreamResponse(w, resp, policy.RouteTrustedRouter, reason, requestStream, endpoint)
 }
 
@@ -355,6 +377,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			merged = append(merged, models...)
 		}
 	}
+	merged = append(merged, aliasModels(s.cfg.Aliases)...)
 
 	route := policy.RouteLocal
 	if s.tr != nil {
@@ -410,6 +433,12 @@ func (s *Server) acquireLocalSlot(ctx context.Context) localSlotResult {
 func (s *Server) releaseLocalSlot() {
 	<-s.localSlots
 	s.stats.inFlightLocal.Add(-1)
+}
+
+func (s *Server) countSkippedUnmapped(decision policy.Decision) {
+	if decision.BurstSkippedUnmapped {
+		s.stats.burstsSkippedUnmapped.Add(1)
+	}
 }
 
 func shouldBurstLocalResponse(resp *http.Response, model string) (bool, error) {
@@ -539,12 +568,12 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 	if s.cfg.Token == "" {
 		return true
 	}
-	got := r.Header.Get("Authorization")
-	want := "Bearer " + s.cfg.Token
-	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
+	bearerOK := subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.cfg.Token))
+	apiKeyOK := subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Api-Key")), []byte(s.cfg.Token))
+	if bearerOK|apiKeyOK == 1 {
 		return true
 	}
-	writeRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "authentication_error")
+	writeRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token or x-api-key", "authentication_error")
 	return false
 }
 
@@ -558,6 +587,26 @@ func trustedRouterError(err error) (int, string) {
 		return status, trErr.Message
 	}
 	return http.StatusBadGateway, err.Error()
+}
+
+func passthroughEndpointNotFound(endpoint endpointFamily, err error) bool {
+	if !isTrustedRouterOnlyEndpoint(endpoint) {
+		return false
+	}
+	var notFound *trustedrouter.NotFoundError
+	if errors.As(err, &notFound) {
+		return true
+	}
+	var trErr *trustedrouter.Error
+	return errors.As(err, &trErr) && trErr.StatusCode == http.StatusNotFound
+}
+
+func isTrustedRouterOnlyEndpoint(endpoint endpointFamily) bool {
+	return endpoint == endpointMessages || endpoint == endpointResponses
+}
+
+func writePassthroughUnsupported(w http.ResponseWriter, path string, reason policy.Reason) {
+	writeRoutedError(w, policy.RouteTrustedRouter, reason, http.StatusNotImplemented, "endpoint_not_supported", fmt.Sprintf("%s is not supported by the configured burst upstream", path), "invalid_request_error")
 }
 
 func copyResponseHeaders(dst, src http.Header) {
@@ -651,18 +700,19 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 type stats struct {
-	inFlightLocal   expvar.Int
-	burstsFull      expvar.Int
-	burstsError     expvar.Int
-	forcedLocal     expvar.Int
-	forcedTR        expvar.Int
-	requestsTotal   expvar.Int
-	catalogErrors   expvar.Int
-	routes          routeStats
-	chatRoutes      routeStats
-	embeddingRoutes routeStats
-	messageRoutes   routeStats
-	responseRoutes  routeStats
+	inFlightLocal         expvar.Int
+	burstsFull            expvar.Int
+	burstsError           expvar.Int
+	burstsSkippedUnmapped expvar.Int
+	forcedLocal           expvar.Int
+	forcedTR              expvar.Int
+	requestsTotal         expvar.Int
+	catalogErrors         expvar.Int
+	routes                routeStats
+	chatRoutes            routeStats
+	embeddingRoutes       routeStats
+	messageRoutes         routeStats
+	responseRoutes        routeStats
 }
 
 func newStats() *stats {
@@ -707,14 +757,15 @@ func (s *routeStats) snapshot() map[string]any {
 
 func (s *stats) snapshot() map[string]any {
 	return map[string]any{
-		"in_flight_local": s.inFlightLocal.Value(),
-		"bursts_full":     s.burstsFull.Value(),
-		"bursts_error":    s.burstsError.Value(),
-		"forced_local":    s.forcedLocal.Value(),
-		"forced_tr":       s.forcedTR.Value(),
-		"requests_total":  s.requestsTotal.Value(),
-		"catalog_errors":  s.catalogErrors.Value(),
-		"routes":          s.routes.snapshot(),
+		"in_flight_local":         s.inFlightLocal.Value(),
+		"bursts_full":             s.burstsFull.Value(),
+		"bursts_error":            s.burstsError.Value(),
+		"bursts_skipped_unmapped": s.burstsSkippedUnmapped.Value(),
+		"forced_local":            s.forcedLocal.Value(),
+		"forced_tr":               s.forcedTR.Value(),
+		"requests_total":          s.requestsTotal.Value(),
+		"catalog_errors":          s.catalogErrors.Value(),
+		"routes":                  s.routes.snapshot(),
 		"endpoint_routes": map[string]any{
 			string(endpointChatCompletions): s.chatRoutes.snapshot(),
 			string(endpointEmbeddings):      s.embeddingRoutes.snapshot(),
@@ -859,6 +910,29 @@ func (s *Server) localModels(ctx context.Context) ([]map[string]any, error) {
 		out = append(out, bare, prefixed)
 	}
 	return out, nil
+}
+
+func aliasModels(aliases map[string]string) []map[string]any {
+	if len(aliases) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(aliases))
+	for key := range aliases {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]map[string]any, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, map[string]any{
+			"id":       key,
+			"object":   "model",
+			"owned_by": "bursty-alias",
+			"metadata": map[string]any{
+				"local_target": aliases[key],
+			},
+		})
+	}
+	return out
 }
 
 func trustedModelsToMaps(list *trustedrouter.ModelList) ([]map[string]any, error) {

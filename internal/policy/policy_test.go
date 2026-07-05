@@ -166,6 +166,102 @@ func TestDecideFailClosedMissingUpstreams(t *testing.T) {
 	}
 }
 
+func TestDecideAliases(t *testing.T) {
+	t.Parallel()
+
+	aliases := map[string]string{
+		"gpt-4o":       "qwen2.5-coder:32b",
+		"local/gpt-4o": "should-not-win",
+		"openai/gpt-4": "llama3.1",
+	}
+
+	t.Run("rewrites local body and preserves trustedrouter body", func(t *testing.T) {
+		t.Parallel()
+		raw := []byte(`{"model":"gpt-4o","provider":{"sort":"price"},"messages":[]}`)
+		got, err := Decide(raw, true, true, Options{Aliases: aliases})
+		if err != nil {
+			t.Fatalf("Decide() error = %v", err)
+		}
+		if got.Route != RouteLocal || got.Reason != ReasonPolicy {
+			t.Fatalf("route/reason = %s/%s, want local/policy", got.Route, got.Reason)
+		}
+		assertJSONEqual(t, got.LocalBody, []byte(`{"model":"qwen2.5-coder:32b","messages":[]}`))
+		if !bytes.Equal(got.TRBody, raw) {
+			t.Fatalf("TRBody = %s, want original %s", got.TRBody, raw)
+		}
+		if !got.BurstAllowed || got.BurstSkippedUnmapped {
+			t.Fatalf("burst flags allowed=%v skipped=%v, want true/false", got.BurstAllowed, got.BurstSkippedUnmapped)
+		}
+	})
+
+	t.Run("local prefix wins over alias", func(t *testing.T) {
+		t.Parallel()
+		raw := []byte(`{"model":"local/gpt-4o","messages":[]}`)
+		got, err := Decide(raw, true, true, Options{Aliases: aliases})
+		if err != nil {
+			t.Fatalf("Decide() error = %v", err)
+		}
+		if got.Route != RouteLocal || got.Reason != ReasonForced {
+			t.Fatalf("route/reason = %s/%s, want local/forced", got.Route, got.Reason)
+		}
+		assertJSONEqual(t, got.LocalBody, []byte(`{"model":"gpt-4o","messages":[]}`))
+		if got.BurstAllowed || got.BurstSkippedUnmapped {
+			t.Fatalf("burst flags allowed=%v skipped=%v, want false/false", got.BurstAllowed, got.BurstSkippedUnmapped)
+		}
+	})
+}
+
+func TestDecideUnmappedLocalModelBurstPolicy(t *testing.T) {
+	t.Parallel()
+
+	t.Run("unmapped local-native id suppresses burst", func(t *testing.T) {
+		t.Parallel()
+		raw := []byte(`{"model":"llama3.2","messages":[]}`)
+		got, err := Decide(raw, true, true)
+		if err != nil {
+			t.Fatalf("Decide() error = %v", err)
+		}
+		if got.Route != RouteLocal || got.Reason != ReasonPolicy {
+			t.Fatalf("route/reason = %s/%s, want local/policy", got.Route, got.Reason)
+		}
+		if got.BurstAllowed || !got.BurstSkippedUnmapped {
+			t.Fatalf("burst flags allowed=%v skipped=%v, want false/true", got.BurstAllowed, got.BurstSkippedUnmapped)
+		}
+		if !bytes.Equal(got.TRBody, raw) {
+			t.Fatalf("TRBody = %s, want original %s", got.TRBody, raw)
+		}
+	})
+
+	t.Run("fallback model substitutes trustedrouter body", func(t *testing.T) {
+		t.Parallel()
+		raw := []byte(`{"model":"llama3.2","messages":[]}`)
+		got, err := Decide(raw, true, true, Options{BurstFallbackModel: "openai/gpt-4o-mini"})
+		if err != nil {
+			t.Fatalf("Decide() error = %v", err)
+		}
+		if !got.BurstAllowed || got.BurstSkippedUnmapped {
+			t.Fatalf("burst flags allowed=%v skipped=%v, want true/false", got.BurstAllowed, got.BurstSkippedUnmapped)
+		}
+		assertJSONEqual(t, got.LocalBody, raw)
+		assertJSONEqual(t, got.TRBody, []byte(`{"model":"openai/gpt-4o-mini","messages":[]}`))
+	})
+
+	t.Run("namespaced model can burst without fallback", func(t *testing.T) {
+		t.Parallel()
+		raw := []byte(`{"model":"openai/gpt-4o","messages":[]}`)
+		got, err := Decide(raw, true, true)
+		if err != nil {
+			t.Fatalf("Decide() error = %v", err)
+		}
+		if !got.BurstAllowed || got.BurstSkippedUnmapped {
+			t.Fatalf("burst flags allowed=%v skipped=%v, want true/false", got.BurstAllowed, got.BurstSkippedUnmapped)
+		}
+		if !bytes.Equal(got.TRBody, raw) {
+			t.Fatalf("TRBody = %s, want original %s", got.TRBody, raw)
+		}
+	})
+}
+
 func TestDecideTrustedRouterOnly(t *testing.T) {
 	t.Parallel()
 

@@ -192,7 +192,7 @@ func TestBinaryBurstOnFull(t *testing.T) {
 
 	firstDone := make(chan error, 1)
 	go func() {
-		resp, body, err := postChatResult(proc, `{"model":"llama3","messages":[]}`, nil, 5*time.Second)
+		resp, body, err := postChatResult(proc, `{"model":"openai/gpt-4o","messages":[]}`, nil, 5*time.Second)
 		if err != nil {
 			firstDone <- err
 			return
@@ -209,7 +209,7 @@ func TestBinaryBurstOnFull(t *testing.T) {
 		t.Fatal("first request did not reach local")
 	}
 
-	resp, body := postChat(t, proc, `{"model":"llama3","messages":[]}`, nil)
+	resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","messages":[]}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("burst status = %d body=%s", resp.StatusCode, body)
 	}
@@ -226,6 +226,248 @@ func TestBinaryBurstOnFull(t *testing.T) {
 	if localLog.count() != 1 {
 		t.Fatalf("local calls = %d, want 1", localLog.count())
 	}
+}
+
+func TestBinaryAliasRoutingModelsAndBurst(t *testing.T) {
+	t.Run("alias rewrites local body and appears in models", func(t *testing.T) {
+		localLog := &requestLog{}
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case chatPath:
+				localLog.add(r)
+				writeJSON(w, http.StatusOK, map[string]any{"id": "local"})
+			case "/v1/models":
+				writeJSON(w, http.StatusOK, map[string]any{
+					"data": []map[string]any{{"id": "llama3", "object": "model"}},
+				})
+			default:
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "unexpected local path"})
+			}
+		}))
+		defer local.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL: local.URL,
+			aliases:  []string{"gpt-4o=llama3"},
+		})
+
+		resp, body := postChat(t, proc, `{"model":"gpt-4o","messages":[]}`, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "local", "policy")
+		assertTopLevelString(t, localLog.last(t).Body, "model", "llama3")
+
+		resp, body = get(t, proc, "/v1/models", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("models status = %d body=%s", resp.StatusCode, body)
+		}
+		ids := modelIDs(t, body)
+		if !ids["gpt-4o"] {
+			t.Fatalf("missing alias model in %#v; body=%s", ids, body)
+		}
+	})
+
+	t.Run("alias burst sends original model", func(t *testing.T) {
+		enteredLocal := make(chan struct{})
+		releaseLocal := make(chan struct{})
+		var enterOnce sync.Once
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() { close(releaseLocal) })
+		}
+		defer release()
+
+		localLog := &requestLog{}
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			localLog.add(r)
+			enterOnce.Do(func() { close(enteredLocal) })
+			<-releaseLocal
+			writeJSON(w, http.StatusOK, map[string]any{"id": "local"})
+		}))
+		defer local.Close()
+
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			writeJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+		}))
+		defer tr.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL:            local.URL,
+			trAPIKey:            "e2e-tr-key",
+			trBaseURL:           tr.URL + "/v1",
+			trCatalogURL:        tr.URL + "/v1",
+			localMaxConcurrency: 1,
+			aliases:             []string{"gpt-4o=llama3"},
+		})
+
+		firstDone := make(chan error, 1)
+		go func() {
+			resp, body, err := postChatResult(proc, `{"model":"gpt-4o","messages":[]}`, nil, 5*time.Second)
+			if err != nil {
+				firstDone <- err
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				firstDone <- fmt.Errorf("first status = %d body=%s", resp.StatusCode, body)
+				return
+			}
+			firstDone <- nil
+		}()
+		select {
+		case <-enteredLocal:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first request did not reach local")
+		}
+		assertTopLevelString(t, localLog.last(t).Body, "model", "llama3")
+
+		resp, body := postChat(t, proc, `{"model":"gpt-4o","messages":[]}`, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("burst status = %d body=%s", resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "trustedrouter", "burst-full")
+		assertTopLevelString(t, trLog.last(t).Body, "model", "gpt-4o")
+
+		release()
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestBinaryUnmappedLocalModelSuppressionAndFallback(t *testing.T) {
+	t.Run("unmapped full returns 429 without trustedrouter call", func(t *testing.T) {
+		enteredLocal := make(chan struct{})
+		releaseLocal := make(chan struct{})
+		var enterOnce sync.Once
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() { close(releaseLocal) })
+		}
+		defer release()
+
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			enterOnce.Do(func() { close(enteredLocal) })
+			<-releaseLocal
+			writeJSON(w, http.StatusOK, map[string]any{"id": "local"})
+		}))
+		defer local.Close()
+
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			writeJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+		}))
+		defer tr.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL:            local.URL,
+			trAPIKey:            "e2e-tr-key",
+			trBaseURL:           tr.URL + "/v1",
+			trCatalogURL:        tr.URL + "/v1",
+			localMaxConcurrency: 1,
+		})
+
+		firstDone := make(chan error, 1)
+		go func() {
+			resp, body, err := postChatResult(proc, `{"model":"llama3.2","messages":[]}`, nil, 5*time.Second)
+			if err != nil {
+				firstDone <- err
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				firstDone <- fmt.Errorf("first status = %d body=%s", resp.StatusCode, body)
+				return
+			}
+			firstDone <- nil
+		}()
+		select {
+		case <-enteredLocal:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first request did not reach local")
+		}
+
+		resp, body := postChat(t, proc, `{"model":"llama3.2","messages":[]}`, nil)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "local", "burst-full")
+		if trLog.count() != 0 {
+			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		}
+
+		release()
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("fallback model is sent to trustedrouter", func(t *testing.T) {
+		enteredLocal := make(chan struct{})
+		releaseLocal := make(chan struct{})
+		var enterOnce sync.Once
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() { close(releaseLocal) })
+		}
+		defer release()
+
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			enterOnce.Do(func() { close(enteredLocal) })
+			<-releaseLocal
+			writeJSON(w, http.StatusOK, map[string]any{"id": "local"})
+		}))
+		defer local.Close()
+
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			writeJSON(w, http.StatusOK, map[string]any{"model": "openai/gpt-4o-mini"})
+		}))
+		defer tr.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL:            local.URL,
+			trAPIKey:            "e2e-tr-key",
+			trBaseURL:           tr.URL + "/v1",
+			trCatalogURL:        tr.URL + "/v1",
+			localMaxConcurrency: 1,
+			burstFallbackModel:  "openai/gpt-4o-mini",
+		})
+
+		firstDone := make(chan error, 1)
+		go func() {
+			resp, body, err := postChatResult(proc, `{"model":"llama3.2","messages":[]}`, nil, 5*time.Second)
+			if err != nil {
+				firstDone <- err
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				firstDone <- fmt.Errorf("first status = %d body=%s", resp.StatusCode, body)
+				return
+			}
+			firstDone <- nil
+		}()
+		select {
+		case <-enteredLocal:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first request did not reach local")
+		}
+
+		resp, body := postChat(t, proc, `{"model":"llama3.2","messages":[]}`, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "trustedrouter", "burst-full")
+		assertTopLevelString(t, trLog.last(t).Body, "model", "openai/gpt-4o-mini")
+
+		release()
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestBinaryBurstOnError(t *testing.T) {
@@ -249,7 +491,7 @@ func TestBinaryBurstOnError(t *testing.T) {
 			trCatalogURL: tr.URL + "/v1",
 		})
 
-		resp, body := postChat(t, proc, `{"model":"llama3","messages":[]}`, nil)
+		resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","messages":[]}`, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
 		}
@@ -276,7 +518,7 @@ func TestBinaryBurstOnError(t *testing.T) {
 			trCatalogURL: tr.URL + "/v1",
 		})
 
-		resp, body := postChat(t, proc, `{"model":"llama3","messages":[]}`, nil)
+		resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","messages":[]}`, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
 		}
@@ -420,6 +662,7 @@ func TestBinarySanitizesInboundHeaders(t *testing.T) {
 	inbound := http.Header{
 		"Authorization":             {"Bearer inbound-secret"},
 		"Cookie":                    {"session=secret"},
+		"X-Api-Key":                 {"inbound-secret"},
 		"X-TrustedRouter-Workspace": {"workspace-secret"},
 	}
 
@@ -466,6 +709,86 @@ func TestBinaryTokenAuth(t *testing.T) {
 	resp, body = get(t, proc, "/stats", bearer("secret"))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("stats with token status = %d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestBinaryXAPIKeyAuth(t *testing.T) {
+	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"id": "local"})
+	}))
+	defer local.Close()
+
+	tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unexpected trustedrouter path"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+	}))
+	defer tr.Close()
+
+	proc := startBursty(t, burstyConfig{
+		localURL:     local.URL,
+		trAPIKey:     "e2e-tr-key",
+		trBaseURL:    tr.URL + "/v1",
+		trCatalogURL: tr.URL + "/v1",
+		token:        "secret",
+	})
+
+	resp, body := get(t, proc, "/healthz", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d body=%s", resp.StatusCode, body)
+	}
+	resp, body = postChat(t, proc, `{"model":"llama3","messages":[]}`, xAPIKey("secret"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat x-api-key status = %d body=%s", resp.StatusCode, body)
+	}
+	for _, tt := range []struct {
+		name   string
+		header http.Header
+	}{
+		{name: "bearer", header: bearer("secret")},
+		{name: "x-api-key", header: xAPIKey("secret")},
+	} {
+		resp, body = do(t, proc, http.MethodPost, "/v1/messages", `{"model":"anthropic/claude-haiku-4.5","messages":[]}`, tt.header)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("messages %s status = %d body=%s", tt.name, resp.StatusCode, body)
+		}
+	}
+	resp, body = do(t, proc, http.MethodPost, "/v1/messages", `{"model":"anthropic/claude-haiku-4.5","messages":[]}`, xAPIKey("wrong"))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("messages wrong x-api-key status = %d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestBinaryTrustedRouterOnlyUpstream404MapsTo501(t *testing.T) {
+	tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "missing endpoint"})
+	}))
+	defer tr.Close()
+
+	proc := startBursty(t, burstyConfig{
+		trAPIKey:     "e2e-tr-key",
+		trBaseURL:    tr.URL + "/v1",
+		trCatalogURL: tr.URL + "/v1",
+	})
+
+	for _, tt := range []struct {
+		path string
+		body string
+	}{
+		{path: "/v1/messages", body: `{"model":"anthropic/claude-haiku-4.5","messages":[]}`},
+		{path: "/v1/responses", body: `{"model":"openai/gpt-4.1-mini","input":"hello"}`},
+	} {
+		resp, body := do(t, proc, http.MethodPost, tt.path, tt.body, nil)
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Fatalf("%s status = %d body=%s", tt.path, resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "trustedrouter", "policy")
+		assertErrorEnvelope(t, body)
+		if !bytes.Contains(body, []byte("endpoint_not_supported")) {
+			t.Fatalf("%s body = %s", tt.path, body)
+		}
 	}
 }
 
@@ -539,6 +862,8 @@ type burstyConfig struct {
 	localQueueWait      time.Duration
 	burstOnError        *bool
 	token               string
+	aliases             []string
+	burstFallbackModel  string
 }
 
 type burstyProcess struct {
@@ -579,6 +904,10 @@ func startBursty(t *testing.T, cfg burstyConfig) *burstyProcess {
 		"-local-queue-wait", cfg.localQueueWait.String(),
 		"-burst-on-error=" + strconv.FormatBool(burstOnError),
 		"-token", cfg.token,
+		"-burst-fallback-model", cfg.burstFallbackModel,
+	}
+	for _, alias := range cfg.aliases {
+		args = append(args, "-alias", alias)
 	}
 	cmd := exec.Command(burstyBinary, args...)
 	cmd.Dir = repoRoot
@@ -780,6 +1109,10 @@ func bearer(token string) http.Header {
 	return http.Header{"Authorization": {"Bearer " + token}}
 }
 
+func xAPIKey(token string) http.Header {
+	return http.Header{"X-Api-Key": {token}}
+}
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -792,7 +1125,7 @@ func assertStatsShape(t *testing.T, body []byte) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("stats JSON: %v\n%s", err, body)
 	}
-	for _, key := range []string{"in_flight_local", "bursts_full", "bursts_error", "forced_local", "forced_tr", "requests_total", "catalog_errors", "routes", "endpoint_routes"} {
+	for _, key := range []string{"in_flight_local", "bursts_full", "bursts_error", "bursts_skipped_unmapped", "forced_local", "forced_tr", "requests_total", "catalog_errors", "routes", "endpoint_routes"} {
 		if _, ok := payload[key]; !ok {
 			t.Fatalf("stats missing key %q: %#v", key, payload)
 		}
@@ -884,7 +1217,7 @@ func assertNoTopLevelKey(t *testing.T, body []byte, key string) {
 
 func assertSanitizedLocalHeaders(t *testing.T, header http.Header) {
 	t.Helper()
-	for _, key := range []string{"Authorization", "Cookie", "X-TrustedRouter-Workspace"} {
+	for _, key := range []string{"Authorization", "Cookie", "X-Api-Key", "X-TrustedRouter-Workspace"} {
 		if got := header.Get(key); got != "" {
 			t.Fatalf("%s reached local: %q", key, got)
 		}
@@ -896,7 +1229,7 @@ func assertSanitizedTrustedRouterHeaders(t *testing.T, header http.Header, apiKe
 	if got, want := header.Get("Authorization"), "Bearer "+apiKey; got != want {
 		t.Fatalf("TrustedRouter Authorization = %q, want SDK bearer %q", got, want)
 	}
-	for _, key := range []string{"Cookie", "X-TrustedRouter-Workspace"} {
+	for _, key := range []string{"Cookie", "X-Api-Key", "X-TrustedRouter-Workspace"} {
 		if got := header.Get(key); got != "" {
 			t.Fatalf("%s reached TrustedRouter: %q", key, got)
 		}

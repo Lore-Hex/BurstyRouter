@@ -14,13 +14,16 @@ done
 | Request directive or condition | Behavior |
 | --- | --- |
 | No directive | Local first when `-local-url` is configured; TrustedRouter when local is absent. |
+| `-alias gpt-4o=llama3.2` and request `model: "gpt-4o"` | Local first; forwards to local as `llama3.2`, but any burst uses the original `gpt-4o` id. |
 | `model: "local/<name>"` | Forced local; forwards to local as `<name>`. |
 | `provider.only: ["local"]` | Forced local; strips `provider` before local forwarding. |
-| `provider.order: ["local"]` | Local preference, not a hard pin; can still burst. |
+| `provider.order: ["local"]` | Local preference, not a hard pin; can still burst when the model is burst-capable. |
 | Any non-local provider in `provider.only` or `provider.order` | Forced TrustedRouter. |
-| Local semaphore full | Bursts to TrustedRouter when not forced and TR is configured; otherwise returns `429`. |
-| Local connect error, `429`, `5xx`, or model-missing `404` | Bursts to TrustedRouter when `-burst-on-error=true`, not forced, and TR is configured. |
-| `/v1/messages` or `/v1/responses` | TrustedRouter-only raw passthrough; local-forced requests return `400`, and local-only mode returns `501`. |
+| Local-native id with no `/`, no alias, and no fallback model | Effectively local-only; local full returns `429`, and local errors surface without a doomed burst. |
+| Local-native id with `-burst-fallback-model` set | Can burst; BurstyRouter substitutes the fallback model only in the burst body. |
+| Local semaphore full | Bursts to TrustedRouter when not forced, TR is configured, and the model is burst-capable; otherwise returns `429`. |
+| Local connect error, `429`, `5xx`, or model-missing `404` | Bursts to TrustedRouter when `-burst-on-error=true`, not forced, TR is configured, and the model is burst-capable. |
+| `/v1/messages` or `/v1/responses` | TrustedRouter-only raw passthrough; local-forced requests return `400`, local-only mode returns `501`, and upstream `404` maps to a Bursty `501`. |
 
 ## Configuration
 
@@ -33,9 +36,19 @@ done
 | `-local-max-concurrency` | `BURSTY_LOCAL_MAX_CONCURRENCY` | `4` |
 | `-local-queue-wait` | `BURSTY_LOCAL_QUEUE_WAIT` | `0s` |
 | `-burst-on-error` | `BURSTY_BURST_ON_ERROR` | `true` |
+| `-burst-fallback-model` | `BURSTY_BURST_FALLBACK_MODEL` | `""` |
+| `-alias from=to` | `BURSTY_ALIASES=a=b,c=d` | `""` |
 | `-token` | `BURSTY_TOKEN` | `""` |
 
-At least one of `-local-url` or `-tr-api-key` is required. Set `BURSTY_TOKEN` whenever the proxy is reachable outside localhost.
+At least one of `-local-url` or `-tr-api-key` is required. Set `BURSTY_TOKEN` whenever the proxy is reachable outside localhost. Auth accepts either `Authorization: Bearer <token>` or `x-api-key: <token>`.
+
+Aliases map cloud-facing ids to local model ids. For example, `-alias gpt-4o=qwen2.5-coder:32b` lets tools request `gpt-4o`; local receives `qwen2.5-coder:32b`, while bursts still send `gpt-4o`.
+
+## Bursting To Other Clouds
+
+`-tr-base-url` can point at any bearer-keyed OpenAI-compatible `/v1` base URL, including OpenRouter, Together, Groq, or your own upstream. TrustedRouter is only the default. The future savings/pricing features are TrustedRouter-specific.
+
+If that upstream does not implement `/v1/messages` or `/v1/responses`, BurstyRouter maps its `404` to a clean `501 endpoint_not_supported` Bursty error envelope.
 
 ## Endpoints
 
@@ -73,7 +86,7 @@ Routes are `local` or `trustedrouter`. Reasons are `policy`, `forced`, `burst-fu
 
 ## Stats
 
-`GET /stats` reports `in_flight_local`, `bursts_full`, `bursts_error`, `forced_local`, `forced_tr`, `requests_total`, global `routes`, and `endpoint_routes` for `chat_completions`, `embeddings`, `messages`, and `responses`.
+`GET /stats` reports `in_flight_local`, `bursts_full`, `bursts_error`, `bursts_skipped_unmapped`, `forced_local`, `forced_tr`, `requests_total`, global `routes`, and `endpoint_routes` for `chat_completions`, `embeddings`, `messages`, and `responses`.
 
 ## Setup
 

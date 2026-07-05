@@ -50,6 +50,24 @@ export TRUSTEDROUTER_API_KEY="tr_..."
 burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY"
 ```
 
+Local plus aliases for cloud-facing model names:
+
+```bash
+export TRUSTEDROUTER_API_KEY="tr_..."
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -alias gpt-4o=llama3.2 \
+  -alias anthropic/claude-haiku-4.5=qwen2.5-coder:32b
+```
+
+To burst unmapped local-native model ids, add a fallback model:
+
+```bash
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -burst-fallback-model openai/gpt-4o-mini
+```
+
 TrustedRouter-only:
 
 ```bash
@@ -96,6 +114,21 @@ export BURSTY_HOST="https://<your-domain>.ngrok.app"
 curl -fsS -H "Authorization: Bearer $BURSTY_TOKEN" "$BURSTY_HOST/v1/models"
 ```
 
+`x-api-key: $BURSTY_TOKEN` is also accepted for Anthropic-family clients.
+
+## Other Burst Targets
+
+TrustedRouter is the default burst target, but `-tr-base-url` can point at any bearer-keyed OpenAI-compatible `/v1` base URL. Savings/pricing features are TrustedRouter-specific.
+
+```bash
+export TRUSTEDROUTER_API_KEY="<upstream bearer token>"
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -tr-base-url "https://openrouter.ai/api/v1"
+```
+
+If that upstream lacks `/v1/messages` or `/v1/responses`, BurstyRouter returns a clean `501 endpoint_not_supported` envelope.
+
 ## Harness Wiring
 
 Ask which harness and emit only that path.
@@ -109,6 +142,12 @@ Settings -> Models -> OpenAI API override
 Base URL: https://<host>/v1
 API key: $BURSTY_TOKEN, or any string when BURSTY_TOKEN is unset
 Models: local/llama3.2, anthropic/claude-haiku-4.5
+```
+
+With aliases, list alias ids such as:
+
+```text
+Models: gpt-4o, anthropic/claude-haiku-4.5
 ```
 
 Verify:
@@ -130,11 +169,13 @@ export ANTHROPIC_BASE_URL="https://<host>"
 export ANTHROPIC_API_KEY="${BURSTY_TOKEN:-any-string}"
 ```
 
+These clients send `x-api-key`; BurstyRouter accepts it when `BURSTY_TOKEN` is set.
+
 Verify:
 
 ```bash
 curl -is "https://<host>/v1/messages" \
-  -H "Authorization: Bearer $BURSTY_TOKEN" \
+  -H "x-api-key: $BURSTY_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}' \
   | awk 'BEGIN{found=0} /^X-Bursty-Route:/ {print; found=1} END{exit found?0:1}'
@@ -168,7 +209,7 @@ curl -is "https://<host>/v1/chat/completions" \
 ```text
 Base URL: https://<host>/v1
 API key: $BURSTY_TOKEN, or any string when BURSTY_TOKEN is unset
-Model: local/<local-model> or a TrustedRouter model
+Model: local/<local-model>, an alias id such as gpt-4o, or a TrustedRouter model
 ```
 
 Verify with `/v1/chat/completions` and assert `X-Bursty-Route` is present.
@@ -193,10 +234,18 @@ Force TrustedRouter with a non-local provider:
 {"model":"anthropic/claude-haiku-4.5","provider":{"order":["anthropic"]},"messages":[{"role":"user","content":"ping"}]}
 ```
 
+Alias cloud id to local model:
+
+```bash
+burstyrouter -local-url http://127.0.0.1:11434 -alias gpt-4o=llama3.2
+```
+
 Bursting:
 
 - `provider.only:["local"]` and `local/` are hard local pins and do not burst.
-- Default local-first requests burst when local is full, local errors, or local returns a model-missing `404`.
+- Aliased requests burst with the original cloud-facing model id.
+- Default local-first requests burst when local is full, local errors, or local returns a model-missing `404`, unless the model is an unmapped local-native id with no `/`.
+- Use `-burst-fallback-model` to let unmapped local-native ids burst with a configured upstream model.
 - `/v1/messages` and `/v1/responses` are TrustedRouter-only passthrough endpoints.
 
 Read routing:

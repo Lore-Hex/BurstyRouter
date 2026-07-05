@@ -19,7 +19,9 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 		envLocalMaxConcurrency: "9",
 		envLocalQueueWait:      "250ms",
 		envBurstOnError:        "false",
+		envBurstFallbackModel:  "openai/gpt-4o-mini",
 		envToken:               "env-token",
+		envAliases:             "gpt-4o=llama3.2, anthropic/claude-haiku-4.5=llama3.1",
 	}
 	cfg, err := Parse([]string{
 		"-listen", ":9999",
@@ -27,7 +29,9 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 		"-tr-catalog-url", "http://flag-catalog/v1",
 		"-local-max-concurrency", "2",
 		"-local-queue-wait", "1s",
+		"-burst-fallback-model", "openai/gpt-4o",
 		"-burst-on-error=true",
+		"-alias", "openai/gpt-4.1=qwen2.5-coder:32b",
 	}, envLookup(env), &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
@@ -44,6 +48,19 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 	if cfg.LocalQueueWait != time.Second || !cfg.BurstOnError {
 		t.Fatalf("duration/bool parse failed: %#v", cfg)
 	}
+	if cfg.BurstFallbackModel != "openai/gpt-4o" {
+		t.Fatalf("burst fallback = %q, want flag value", cfg.BurstFallbackModel)
+	}
+	wantAliases := map[string]string{
+		"gpt-4o":                     "llama3.2",
+		"anthropic/claude-haiku-4.5": "llama3.1",
+		"openai/gpt-4.1":             "qwen2.5-coder:32b",
+	}
+	for from, to := range wantAliases {
+		if cfg.Aliases[from] != to {
+			t.Fatalf("alias %q = %q, want %q; aliases=%#v", from, cfg.Aliases[from], to, cfg.Aliases)
+		}
+	}
 }
 
 func TestParseValidationAndUsage(t *testing.T) {
@@ -56,10 +73,96 @@ func TestParseValidationAndUsage(t *testing.T) {
 	if _, err := Parse([]string{"-h"}, envLookup(nil), &usage); err == nil {
 		t.Fatal("Parse(-h) error = nil, want flag.ErrHelp")
 	}
-	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_BURST_ON_ERROR"} {
+	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES"} {
 		if !strings.Contains(usage.String(), want) {
 			t.Fatalf("usage missing %q:\n%s", want, usage.String())
 		}
+	}
+}
+
+func TestParseAliases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		env     map[string]string
+		args    []string
+		want    map[string]string
+		wantErr string
+	}{
+		{
+			name: "env comma list",
+			env: map[string]string{
+				envLocalURL: "http://local",
+				envAliases:  " gpt-4o = llama3.2 , anthropic/claude-haiku-4.5=qwen2.5 ",
+			},
+			want: map[string]string{
+				"gpt-4o":                     "llama3.2",
+				"anthropic/claude-haiku-4.5": "qwen2.5",
+			},
+		},
+		{
+			name: "repeat flags",
+			env:  map[string]string{envLocalURL: "http://local"},
+			args: []string{"-alias", "gpt-4o=llama3.2", "-alias", "openai/gpt-4.1=qwen"},
+			want: map[string]string{
+				"gpt-4o":         "llama3.2",
+				"openai/gpt-4.1": "qwen",
+			},
+		},
+		{
+			name:    "invalid shape",
+			env:     map[string]string{envLocalURL: "http://local"},
+			args:    []string{"-alias", "gpt-4o"},
+			wantErr: "from=to",
+		},
+		{
+			name:    "empty target",
+			env:     map[string]string{envLocalURL: "http://local"},
+			args:    []string{"-alias", "gpt-4o="},
+			wantErr: "non-empty",
+		},
+		{
+			name:    "duplicate env key",
+			env:     map[string]string{envLocalURL: "http://local", envAliases: "gpt-4o=llama3,gpt-4o=qwen"},
+			wantErr: "duplicate alias",
+		},
+		{
+			name:    "duplicate flag key",
+			env:     map[string]string{envLocalURL: "http://local"},
+			args:    []string{"-alias", "gpt-4o=llama3", "-alias", "gpt-4o=qwen"},
+			wantErr: "duplicate alias",
+		},
+		{
+			name:    "duplicate env and flag key",
+			env:     map[string]string{envLocalURL: "http://local", envAliases: "gpt-4o=llama3"},
+			args:    []string{"-alias", "gpt-4o=qwen"},
+			wantErr: "duplicate alias",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := Parse(tt.args, envLookup(tt.env), &bytes.Buffer{})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Parse() error = %v, want containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			for from, to := range tt.want {
+				if cfg.Aliases[from] != to {
+					t.Fatalf("alias %q = %q, want %q; aliases=%#v", from, cfg.Aliases[from], to, cfg.Aliases)
+				}
+			}
+			if len(cfg.Aliases) != len(tt.want) {
+				t.Fatalf("aliases=%#v, want %#v", cfg.Aliases, tt.want)
+			}
+		})
 	}
 }
 

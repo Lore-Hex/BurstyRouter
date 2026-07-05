@@ -38,13 +38,21 @@ type RequestView struct {
 	Provider *ProviderDirective `json:"provider"`
 }
 
+// Options controls policy-only request rewriting and burst eligibility.
+type Options struct {
+	Aliases            map[string]string
+	BurstFallbackModel string
+}
+
 // Decision is a policy decision plus the body bytes to forward.
 type Decision struct {
-	Route     Route
-	Reason    Reason
-	LocalBody []byte
-	TRBody    []byte
-	View      RequestView
+	Route                Route
+	Reason               Reason
+	LocalBody            []byte
+	TRBody               []byte
+	View                 RequestView
+	BurstAllowed         bool
+	BurstSkippedUnmapped bool
 }
 
 // ConfigError is returned when the request explicitly requires an upstream
@@ -62,18 +70,20 @@ func (e *ConfigError) Error() string {
 }
 
 // Decide selects an upstream and applies the raw local-only body rewrites.
-func Decide(raw []byte, hasLocal, hasTrustedRouter bool) (Decision, error) {
+func Decide(raw []byte, hasLocal, hasTrustedRouter bool, options ...Options) (Decision, error) {
 	view, err := DecodeRequestView(raw)
 	if err != nil {
 		return Decision{}, err
 	}
+	opts := firstOptions(options)
+	aliasTarget, aliased := aliasFor(view, opts.Aliases)
 
 	decision := Decision{TRBody: raw, View: view}
 	localBody := func() error {
 		if decision.LocalBody != nil {
 			return nil
 		}
-		body, err := localForwardBody(raw, view)
+		body, err := localForwardBody(raw, view, aliasTarget)
 		if err != nil {
 			return err
 		}
@@ -86,6 +96,11 @@ func Decide(raw []byte, hasLocal, hasTrustedRouter bool) (Decision, error) {
 		}
 		decision.Route = RouteLocal
 		decision.Reason = reason
+		if reason == ReasonPolicy && hasTrustedRouter {
+			if err := applyBurstPolicy(&decision, raw, view, aliased, opts.BurstFallbackModel); err != nil {
+				return Decision{}, err
+			}
+		}
 		return decision, nil
 	}
 	trustedRouter := func(reason Reason) (Decision, error) {
@@ -173,7 +188,7 @@ func DecodeRequestView(raw []byte) (RequestView, error) {
 	return view, nil
 }
 
-func localForwardBody(raw []byte, view RequestView) ([]byte, error) {
+func localForwardBody(raw []byte, view RequestView, aliasTarget string) ([]byte, error) {
 	body, err := RemoveTopLevelKey(raw, "provider")
 	if err != nil {
 		return nil, err
@@ -183,8 +198,54 @@ func localForwardBody(raw []byte, view RequestView) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+	} else if aliasTarget != "" {
+		body, err = ReplaceTopLevelString(body, "model", aliasTarget)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return body, nil
+}
+
+func firstOptions(options []Options) Options {
+	if len(options) == 0 {
+		return Options{}
+	}
+	return options[0]
+}
+
+func aliasFor(view RequestView, aliases map[string]string) (string, bool) {
+	if strings.HasPrefix(view.Model, "local/") || len(aliases) == 0 {
+		return "", false
+	}
+	target, ok := aliases[view.Model]
+	return target, ok
+}
+
+func applyBurstPolicy(decision *Decision, raw []byte, view RequestView, aliased bool, fallbackModel string) error {
+	if aliased || cloudRoutableModel(view.Model) {
+		decision.BurstAllowed = true
+		return nil
+	}
+	fallbackModel = strings.TrimSpace(fallbackModel)
+	if fallbackModel == "" {
+		decision.BurstSkippedUnmapped = true
+		return nil
+	}
+	body, err := ReplaceTopLevelString(raw, "model", fallbackModel)
+	if err != nil {
+		return err
+	}
+	decision.TRBody = body
+	decision.BurstAllowed = true
+	return nil
+}
+
+func cloudRoutableModel(model string) bool {
+	if strings.HasPrefix(model, "local/") {
+		return false
+	}
+	return strings.Contains(model, "/") || strings.HasPrefix(model, "trustedrouter/")
 }
 
 func isLocalOnly(provider *ProviderDirective) bool {
