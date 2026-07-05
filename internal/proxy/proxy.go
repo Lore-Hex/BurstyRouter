@@ -281,6 +281,11 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 		s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
 		return
 	}
+	if shouldBurst && forced {
+		closeBurstResponseBody(resp)
+		writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", fmt.Sprintf("local upstream returned status %d", resp.StatusCode), "api_error")
+		return
+	}
 
 	s.serveUpstreamResponse(w, resp, policy.RouteLocal, decision.Reason, decision.View.Stream, endpoint.family)
 }

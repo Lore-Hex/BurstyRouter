@@ -755,11 +755,14 @@ func TestBurstOnError(t *testing.T) {
 		tr, trCalls := fakeTR(t)
 		proxy := newProxyWithHandlers(t, config.Config{TRAPIKey: "tr-key", BurstOnError: true}, local, tr)
 
-		resp, body := postChat(t, proxy, `{"model":"llama3","provider":{"only":["local"]},"messages":[]}`, "")
-		if resp.StatusCode != http.StatusInternalServerError {
+		resp, body := postChat(t, proxy, `{"model":"local/llama3","messages":[]}`, "")
+		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
 		}
-		assertBurstyBlock(t, body, "local", "forced")
+		if resp.Header.Get("X-Bursty-Route") != "local" || resp.Header.Get("X-Bursty-Reason") != "forced" {
+			t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+		}
+		assertErrorEnvelope(t, body)
 		if trCalls.Load() != 0 {
 			t.Fatalf("tr calls = %d, want 0", trCalls.Load())
 		}

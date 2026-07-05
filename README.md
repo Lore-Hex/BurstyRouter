@@ -77,7 +77,7 @@ Routes are `local` or `trustedrouter`. Reasons are `policy`, `forced`, `burst-fu
 
 ## Setup
 
-Use [docs/SETUP.md](docs/SETUP.md) for a copy-paste setup reference. Agent harnesses can use [skills/bursty-setup/SKILL.md](skills/bursty-setup/SKILL.md) as an interactive setup skill.
+Use [docs/SETUP.md](docs/SETUP.md) for a copy-paste setup reference. Run `scripts/smoke.sh` to verify a local install against Ollama. Agent harnesses can use [skills/bursty-setup/SKILL.md](skills/bursty-setup/SKILL.md) as an interactive setup skill.
 
 ## License
 

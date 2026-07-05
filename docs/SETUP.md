@@ -45,6 +45,14 @@ burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_K
 
 ## 3. Verify
 
+Run the operator smoke against your local Ollama install:
+
+```bash
+scripts/smoke.sh
+```
+
+By default it uses `BURSTY_LOCAL_URL=http://127.0.0.1:11434` and starts BurstyRouter on `127.0.0.1:8383`. Set `BURSTY_MODEL` if you want to force a specific local model.
+
 Without `BURSTY_TOKEN`:
 
 ```bash
@@ -95,6 +103,8 @@ curl -fsS -H "Authorization: Bearer $BURSTY_TOKEN" "$BURSTY_HOST/v1/models"
 ## 5. Wire A Harness
 
 Use the public host for remote harnesses, for example `https://<your-domain>.ngrok.app`. Use `http://127.0.0.1:8383` for local harnesses.
+
+When using a TrustedRouter SDK for Python, JavaScript, Swift, or Go against BurstyRouter, set both the inference base and the control base/catalog base to the BurstyRouter URL. If only inference is pointed at BurstyRouter, SDK catalog/account calls still go directly to the TrustedRouter control plane and bypass the proxy.
 
 ### Cursor
 
