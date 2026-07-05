@@ -63,13 +63,9 @@ func (e *ConfigError) Error() string {
 
 // Decide selects an upstream and applies the raw local-only body rewrites.
 func Decide(raw []byte, hasLocal, hasTrustedRouter bool) (Decision, error) {
-	if _, err := scanTopLevelObject(raw); err != nil {
+	view, err := DecodeRequestView(raw)
+	if err != nil {
 		return Decision{}, err
-	}
-
-	var view RequestView
-	if err := json.Unmarshal(raw, &view); err != nil {
-		return Decision{}, fmt.Errorf("decode request body: %w", err)
 	}
 
 	decision := Decision{TRBody: raw, View: view}
@@ -138,6 +134,43 @@ func Decide(raw []byte, hasLocal, hasTrustedRouter bool) (Decision, error) {
 		return local(ReasonForced)
 	}
 	return local(ReasonPolicy)
+}
+
+// DecideTrustedRouterOnly parses a request for endpoints local OpenAI servers
+// cannot serve. It preserves the original body for TrustedRouter forwarding.
+func DecideTrustedRouterOnly(raw []byte) (Decision, error) {
+	view, err := DecodeRequestView(raw)
+	if err != nil {
+		return Decision{}, err
+	}
+	decision := Decision{
+		Route:  RouteTrustedRouter,
+		Reason: ReasonPolicy,
+		TRBody: raw,
+		View:   view,
+	}
+	if localPinned(view) {
+		decision.Route = RouteLocal
+		decision.Reason = ReasonForced
+		return decision, nil
+	}
+	if mentionsNonLocal(view.Provider) {
+		decision.Reason = ReasonForced
+	}
+	return decision, nil
+}
+
+// DecodeRequestView validates the top-level routing object and decodes the
+// fields needed by BurstyRouter policy.
+func DecodeRequestView(raw []byte) (RequestView, error) {
+	if _, err := scanTopLevelObject(raw); err != nil {
+		return RequestView{}, err
+	}
+	var view RequestView
+	if err := json.Unmarshal(raw, &view); err != nil {
+		return RequestView{}, fmt.Errorf("decode request body: %w", err)
+	}
+	return view, nil
 }
 
 func localForwardBody(raw []byte, view RequestView) ([]byte, error) {

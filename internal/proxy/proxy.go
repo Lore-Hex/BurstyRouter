@@ -22,10 +22,34 @@ import (
 
 const (
 	chatCompletionsPath = "/v1/chat/completions"
+	embeddingsPath      = "/v1/embeddings"
+	messagesPath        = "/v1/messages"
+	responsesPath       = "/v1/responses"
 	modelsPath          = "/v1/models"
+	catalogModelsPath   = "/models"
+	trChatPath          = "/chat/completions"
+	trEmbeddingsPath    = "/embeddings"
+	trMessagesPath      = "/messages"
+	trResponsesPath     = "/responses"
 	maxInboundBodyBytes = 32 << 20
 	max404SniffBytes    = 64 << 10
+	catalogTimeout      = 5 * time.Second
 )
+
+type endpointFamily string
+
+const (
+	endpointChatCompletions endpointFamily = "chat_completions"
+	endpointEmbeddings      endpointFamily = "embeddings"
+	endpointMessages        endpointFamily = "messages"
+	endpointResponses       endpointFamily = "responses"
+)
+
+type localCapableEndpoint struct {
+	family    endpointFamily
+	trPath    string
+	localPost func(context.Context, []byte, http.Header) (*http.Response, error)
+}
 
 type localSlotResult int
 
@@ -43,6 +67,7 @@ type Server struct {
 	localSlots chan struct{}
 	stats      *stats
 	models     modelsCache
+	catalog    *http.Client
 }
 
 // New builds a configured proxy server.
@@ -78,6 +103,7 @@ func New(cfg config.Config) (*Server, error) {
 		tr:         tr,
 		localSlots: slots,
 		stats:      newStats(),
+		catalog:    &http.Client{Timeout: catalogTimeout},
 	}, nil
 }
 
@@ -101,6 +127,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case chatCompletionsPath:
 		s.handleChat(w, r)
+	case embeddingsPath:
+		s.handleEmbeddings(w, r)
+	case messagesPath:
+		s.handleTrustedRouterOnly(w, r, endpointMessages, trMessagesPath)
+	case responsesPath:
+		s.handleTrustedRouterOnly(w, r, endpointResponses, trResponsesPath)
 	case modelsPath:
 		s.handleModels(w, r)
 	default:
@@ -133,6 +165,26 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	s.handleLocalCapable(w, r, localCapableEndpoint{
+		family: endpointChatCompletions,
+		trPath: trChatPath,
+		localPost: func(ctx context.Context, body []byte, header http.Header) (*http.Response, error) {
+			return s.local.Chat(ctx, body, header)
+		},
+	})
+}
+
+func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	s.handleLocalCapable(w, r, localCapableEndpoint{
+		family: endpointEmbeddings,
+		trPath: trEmbeddingsPath,
+		localPost: func(ctx context.Context, body []byte, header http.Header) (*http.Response, error) {
+			return s.local.Embeddings(ctx, body, header)
+		},
+	})
+}
+
+func (s *Server) handleLocalCapable(w http.ResponseWriter, r *http.Request, endpoint localCapableEndpoint) {
 	if r.Method != http.MethodPost {
 		writeRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "invalid_request_error")
 		return
@@ -165,19 +217,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	switch decision.Route {
 	case policy.RouteLocal:
-		s.serveLocalChat(w, r, decision)
+		s.serveLocalCapable(w, r, decision, endpoint)
 	case policy.RouteTrustedRouter:
-		s.serveTrustedRouterChat(w, r, decision.TRBody, decision.View.Stream, decision.Reason)
+		s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, decision.Reason, endpoint.family)
 	default:
 		writeRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusInternalServerError, "internal_error", "unknown route", "api_error")
 	}
 }
 
-func (s *Server) serveLocalChat(w http.ResponseWriter, r *http.Request, decision policy.Decision) {
+func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decision policy.Decision, endpoint localCapableEndpoint) {
 	forced := decision.Reason == policy.ReasonForced
 	if s.local == nil {
 		if s.tr != nil {
-			s.serveTrustedRouterChat(w, r, decision.TRBody, decision.View.Stream, policy.ReasonPolicy)
+			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonPolicy, endpoint.family)
 			return
 		}
 		writeRoutedError(w, policy.RouteLocal, policy.ReasonPolicy, http.StatusBadGateway, "no_local_upstream", "local upstream is not configured", "api_error")
@@ -190,7 +242,7 @@ func (s *Server) serveLocalChat(w http.ResponseWriter, r *http.Request, decision
 	case localSlotFull:
 		if !forced && s.tr != nil {
 			s.stats.burstsFull.Add(1)
-			s.serveTrustedRouterChat(w, r, decision.TRBody, decision.View.Stream, policy.ReasonBurstFull)
+			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstFull, endpoint.family)
 			return
 		}
 		w.Header().Set("Retry-After", "1")
@@ -204,12 +256,12 @@ func (s *Server) serveLocalChat(w http.ResponseWriter, r *http.Request, decision
 	}
 	defer releaseLocalSlot()
 
-	resp, err := s.local.Chat(r.Context(), decision.LocalBody, r.Header)
+	resp, err := endpoint.localPost(r.Context(), decision.LocalBody, r.Header)
 	if err != nil {
 		if !forced && s.cfg.BurstOnError && s.tr != nil {
 			s.stats.burstsError.Add(1)
 			releaseLocalSlot()
-			s.serveTrustedRouterChat(w, r, decision.TRBody, decision.View.Stream, policy.ReasonBurstError)
+			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
 			return
 		}
 		writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", err.Error(), "api_error")
@@ -226,27 +278,58 @@ func (s *Server) serveLocalChat(w http.ResponseWriter, r *http.Request, decision
 		s.stats.burstsError.Add(1)
 		closeBurstResponseBody(resp)
 		releaseLocalSlot()
-		s.serveTrustedRouterChat(w, r, decision.TRBody, decision.View.Stream, policy.ReasonBurstError)
+		s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
 		return
 	}
 
-	s.serveUpstreamResponse(w, resp, policy.RouteLocal, decision.Reason, decision.View.Stream)
+	s.serveUpstreamResponse(w, resp, policy.RouteLocal, decision.Reason, decision.View.Stream, endpoint.family)
 }
 
-func (s *Server) serveTrustedRouterChat(w http.ResponseWriter, r *http.Request, body []byte, requestStream bool, reason policy.Reason) {
+func (s *Server) serveTrustedRouterRaw(w http.ResponseWriter, r *http.Request, path string, body []byte, requestStream bool, reason policy.Reason, endpoint endpointFamily) {
 	if s.tr == nil {
 		w.Header().Set("Retry-After", "1")
 		writeRoutedError(w, policy.RouteLocal, reason, http.StatusTooManyRequests, "local_overloaded", "TrustedRouter is not configured", "rate_limit_error")
 		return
 	}
-	resp, err := s.tr.Chat(r.Context(), body, r.Header)
+	resp, err := s.tr.RawPost(r.Context(), path, body, r.Header)
 	if err != nil {
 		status, message := trustedRouterError(err)
 		writeRoutedError(w, policy.RouteTrustedRouter, reason, status, "trustedrouter_upstream_error", message, "api_error")
 		return
 	}
 	defer resp.Body.Close()
-	s.serveUpstreamResponse(w, resp, policy.RouteTrustedRouter, reason, requestStream)
+	s.serveUpstreamResponse(w, resp, policy.RouteTrustedRouter, reason, requestStream, endpoint)
+}
+
+func (s *Server) handleTrustedRouterOnly(w http.ResponseWriter, r *http.Request, endpoint endpointFamily, path string) {
+	if r.Method != http.MethodPost {
+		writeRoutedError(w, policy.RouteTrustedRouter, policy.ReasonPolicy, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "invalid_request_error")
+		return
+	}
+	s.stats.requestsTotal.Add(1)
+
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxInboundBodyBytes))
+	if err != nil {
+		writeRoutedError(w, policy.RouteTrustedRouter, policy.ReasonPolicy, http.StatusBadRequest, "invalid_request_body", err.Error(), "invalid_request_error")
+		return
+	}
+	decision, err := policy.DecideTrustedRouterOnly(raw)
+	if err != nil {
+		writeRoutedError(w, policy.RouteTrustedRouter, policy.ReasonPolicy, http.StatusBadRequest, "invalid_request_body", err.Error(), "invalid_request_error")
+		return
+	}
+	if decision.Route == policy.RouteLocal {
+		writeRoutedError(w, policy.RouteLocal, policy.ReasonForced, http.StatusBadRequest, "endpoint_not_supported", fmt.Sprintf("%s cannot be served by a local OpenAI-compatible upstream", r.URL.Path), "invalid_request_error")
+		return
+	}
+	if s.tr == nil {
+		writeRoutedError(w, policy.RouteTrustedRouter, decision.Reason, http.StatusNotImplemented, "endpoint_not_supported", fmt.Sprintf("%s requires TrustedRouter; local-only mode cannot serve this endpoint", r.URL.Path), "invalid_request_error")
+		return
+	}
+	if decision.Reason == policy.ReasonForced {
+		s.stats.forcedTR.Add(1)
+	}
+	s.serveTrustedRouterRaw(w, r, path, decision.TRBody, decision.View.Stream, decision.Reason, endpoint)
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -256,7 +339,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	s.stats.requestsTotal.Add(1)
 
-	var merged []map[string]any
+	merged := make([]map[string]any, 0)
 	if s.tr != nil {
 		if models, err := s.cachedTrustedRouterModels(r.Context()); err == nil {
 			merged = append(merged, models...)
@@ -379,8 +462,8 @@ func modelCandidates(model string) []string {
 	return []string{model}
 }
 
-func (s *Server) serveUpstreamResponse(w http.ResponseWriter, resp *http.Response, route policy.Route, reason policy.Reason, requestStream bool) {
-	s.stats.countRoute(route)
+func (s *Server) serveUpstreamResponse(w http.ResponseWriter, resp *http.Response, route policy.Route, reason policy.Reason, requestStream bool, endpoint endpointFamily) {
+	s.stats.countEndpointRoute(endpoint, route)
 	copyResponseHeaders(w.Header(), resp.Header)
 	setRouteHeaders(w, route, reason)
 
@@ -563,27 +646,57 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 type stats struct {
-	inFlightLocal expvar.Int
-	burstsFull    expvar.Int
-	burstsError   expvar.Int
-	forcedLocal   expvar.Int
-	forcedTR      expvar.Int
-	requestsTotal expvar.Int
-	routeLocal    expvar.Int
-	routeTR       expvar.Int
+	inFlightLocal   expvar.Int
+	burstsFull      expvar.Int
+	burstsError     expvar.Int
+	forcedLocal     expvar.Int
+	forcedTR        expvar.Int
+	requestsTotal   expvar.Int
+	catalogErrors   expvar.Int
+	routes          routeStats
+	chatRoutes      routeStats
+	embeddingRoutes routeStats
+	messageRoutes   routeStats
+	responseRoutes  routeStats
 }
 
 func newStats() *stats {
 	return &stats{}
 }
 
-func (s *stats) countRoute(route policy.Route) {
+func (s *stats) countEndpointRoute(endpoint endpointFamily, route policy.Route) {
+	s.routes.count(route)
+	switch endpoint {
+	case endpointChatCompletions:
+		s.chatRoutes.count(route)
+	case endpointEmbeddings:
+		s.embeddingRoutes.count(route)
+	case endpointMessages:
+		s.messageRoutes.count(route)
+	case endpointResponses:
+		s.responseRoutes.count(route)
+	}
+}
+
+type routeStats struct {
+	local expvar.Int
+	tr    expvar.Int
+}
+
+func (s *routeStats) count(route policy.Route) {
 	if route == policy.RouteLocal {
-		s.routeLocal.Add(1)
+		s.local.Add(1)
 		return
 	}
 	if route == policy.RouteTrustedRouter {
-		s.routeTR.Add(1)
+		s.tr.Add(1)
+	}
+}
+
+func (s *routeStats) snapshot() map[string]any {
+	return map[string]any{
+		"local":         s.local.Value(),
+		"trustedrouter": s.tr.Value(),
 	}
 }
 
@@ -595,9 +708,13 @@ func (s *stats) snapshot() map[string]any {
 		"forced_local":    s.forcedLocal.Value(),
 		"forced_tr":       s.forcedTR.Value(),
 		"requests_total":  s.requestsTotal.Value(),
-		"routes": map[string]any{
-			"local":         s.routeLocal.Value(),
-			"trustedrouter": s.routeTR.Value(),
+		"catalog_errors":  s.catalogErrors.Value(),
+		"routes":          s.routes.snapshot(),
+		"endpoint_routes": map[string]any{
+			string(endpointChatCompletions): s.chatRoutes.snapshot(),
+			string(endpointEmbeddings):      s.embeddingRoutes.snapshot(),
+			string(endpointMessages):        s.messageRoutes.snapshot(),
+			string(endpointResponses):       s.responseRoutes.snapshot(),
 		},
 	}
 }
@@ -621,15 +738,9 @@ func (s *Server) cachedTrustedRouterModels(ctx context.Context) ([]map[string]an
 	hasStale := s.models.hasData
 	s.models.mu.Unlock()
 
-	list, err := s.tr.Models(ctx)
+	data, err := s.fetchTrustedRouterModelMaps(ctx)
 	if err != nil {
-		if hasStale {
-			return stale, nil
-		}
-		return nil, err
-	}
-	data, err := trustedModelsToMaps(list)
-	if err != nil {
+		s.stats.catalogErrors.Add(1)
 		if hasStale {
 			return stale, nil
 		}
@@ -642,6 +753,71 @@ func (s *Server) cachedTrustedRouterModels(ctx context.Context) ([]map[string]an
 	s.models.hasData = true
 	s.models.mu.Unlock()
 	return data, nil
+}
+
+func (s *Server) fetchTrustedRouterModelMaps(ctx context.Context) ([]map[string]any, error) {
+	list, err := s.tr.Models(ctx)
+	if err == nil {
+		return trustedModelsToMaps(list)
+	}
+	if !isTrustedRouterNotFound(err) {
+		return nil, err
+	}
+	// The SDK default reaches TrustedRouter's attested API plane, where /v1/models
+	// can be absent; the public model catalog lives on the control plane.
+	return s.fetchControlPlaneCatalog(ctx)
+}
+
+func (s *Server) fetchControlPlaneCatalog(ctx context.Context) ([]map[string]any, error) {
+	ctx, cancel := context.WithTimeout(ctx, catalogTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.catalogModelsURL(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.catalogClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("trustedrouter catalog status %d", resp.StatusCode)
+	}
+	var payload struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if payload.Data == nil {
+		return []map[string]any{}, nil
+	}
+	return payload.Data, nil
+}
+
+func (s *Server) catalogClient() *http.Client {
+	if s.catalog != nil {
+		return s.catalog
+	}
+	return &http.Client{Timeout: catalogTimeout}
+}
+
+func (s *Server) catalogModelsURL() string {
+	baseURL := strings.TrimRight(strings.TrimSpace(s.cfg.TRCatalogURL), "/")
+	if baseURL == "" {
+		baseURL = config.DefaultTRCatalogURL
+	}
+	return baseURL + catalogModelsPath
+}
+
+func isTrustedRouterNotFound(err error) bool {
+	var notFound *trustedrouter.NotFoundError
+	if errors.As(err, &notFound) {
+		return true
+	}
+	var trErr *trustedrouter.Error
+	return errors.As(err, &trErr) && trErr.StatusCode == http.StatusNotFound
 }
 
 func (s *Server) localModels(ctx context.Context) ([]map[string]any, error) {

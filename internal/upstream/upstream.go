@@ -85,6 +85,11 @@ func (l *Local) Chat(ctx context.Context, body []byte, inbound http.Header) (*ht
 	return l.do(ctx, http.MethodPost, "/chat/completions", bytes.NewReader(body), inbound)
 }
 
+// Embeddings forwards an embeddings request to local /v1/embeddings.
+func (l *Local) Embeddings(ctx context.Context, body []byte, inbound http.Header) (*http.Response, error) {
+	return l.do(ctx, http.MethodPost, "/embeddings", bytes.NewReader(body), inbound)
+}
+
 // Models fetches local /v1/models.
 func (l *Local) Models(ctx context.Context) (*http.Response, error) {
 	return l.do(ctx, http.MethodGet, "/models", nil, nil)
@@ -133,11 +138,18 @@ func NewTrustedRouterWithHTTPClient(apiKey, baseURL string, httpClient *http.Cli
 // Chat forwards a verbatim JSON request body with SDK auth. Retries and SDK
 // timeouts stay disabled for proxy semantics; lifecycle is the inbound context.
 func (t *TrustedRouter) Chat(ctx context.Context, body []byte, inbound http.Header) (*http.Response, error) {
+	return t.RawPost(ctx, "/chat/completions", body, inbound)
+}
+
+// RawPost forwards a verbatim JSON request body through the SDK RawRequest API.
+// Retries and SDK timeouts stay disabled for proxy semantics; lifecycle is the
+// inbound context.
+func (t *TrustedRouter) RawPost(ctx context.Context, path string, body []byte, inbound http.Header) (*http.Response, error) {
 	opts := &trustedrouter.CallOptions{
 		ExtraHeaders: sanitizedExtraHeaders(inbound),
 		Timeout:      ptr(time.Duration(0)),
 	}
-	return t.client.RawRequest(ctx, http.MethodPost, "/chat/completions", json.RawMessage(body), opts)
+	return t.client.RawRequest(ctx, http.MethodPost, path, json.RawMessage(body), opts)
 }
 
 // Models fetches the TrustedRouter model catalog through the SDK.

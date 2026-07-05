@@ -166,6 +166,58 @@ func TestDecideFailClosedMissingUpstreams(t *testing.T) {
 	}
 }
 
+func TestDecideTrustedRouterOnly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		raw    []byte
+		route  Route
+		reason Reason
+	}{
+		{
+			name:   "default trustedrouter",
+			raw:    []byte(`{"model":"x","messages":[]}`),
+			route:  RouteTrustedRouter,
+			reason: ReasonPolicy,
+		},
+		{
+			name:   "provider external forced",
+			raw:    []byte(`{"model":"x","provider":{"order":["anthropic"]},"messages":[]}`),
+			route:  RouteTrustedRouter,
+			reason: ReasonForced,
+		},
+		{
+			name:   "provider only local unsupported",
+			raw:    []byte(`{"model":"x","provider":{"only":["local"]},"messages":[]}`),
+			route:  RouteLocal,
+			reason: ReasonForced,
+		},
+		{
+			name:   "local model prefix unsupported",
+			raw:    []byte(`{"model":"local/x","messages":[]}`),
+			route:  RouteLocal,
+			reason: ReasonForced,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := DecideTrustedRouterOnly(tt.raw)
+			if err != nil {
+				t.Fatalf("DecideTrustedRouterOnly() error = %v", err)
+			}
+			if got.Route != tt.route || got.Reason != tt.reason {
+				t.Fatalf("route/reason = %s/%s, want %s/%s", got.Route, got.Reason, tt.route, tt.reason)
+			}
+			if !bytes.Equal(got.TRBody, tt.raw) {
+				t.Fatalf("TRBody = %s, want verbatim %s", got.TRBody, tt.raw)
+			}
+		})
+	}
+}
+
 func TestDecideRejectsDuplicateRoutingKeys(t *testing.T) {
 	t.Parallel()
 

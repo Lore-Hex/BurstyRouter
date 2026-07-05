@@ -17,11 +17,15 @@ const (
 	envLocalURL            = "BURSTY_LOCAL_URL"
 	envTRAPIKey            = "TRUSTEDROUTER_API_KEY"
 	envTRBaseURL           = "BURSTY_TR_BASE_URL"
+	envTRCatalogURL        = "BURSTY_TR_CATALOG_URL"
 	envLocalMaxConcurrency = "BURSTY_LOCAL_MAX_CONCURRENCY"
 	envLocalQueueWait      = "BURSTY_LOCAL_QUEUE_WAIT"
 	envBurstOnError        = "BURSTY_BURST_ON_ERROR"
 	envToken               = "BURSTY_TOKEN"
 )
+
+// DefaultTRCatalogURL is the public TrustedRouter control-plane catalog base URL.
+const DefaultTRCatalogURL = "https://trustedrouter.com/v1"
 
 // Config is the complete runtime configuration for a BurstyRouter process.
 type Config struct {
@@ -29,6 +33,7 @@ type Config struct {
 	LocalURL            string
 	TRAPIKey            string
 	TRBaseURL           string
+	TRCatalogURL        string
 	LocalMaxConcurrency int
 	LocalQueueWait      time.Duration
 	BurstOnError        bool
@@ -59,6 +64,7 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 	fs.StringVar(&cfg.LocalURL, "local-url", cfg.LocalURL, "local OpenAI-compatible base URL")
 	fs.StringVar(&cfg.TRAPIKey, "tr-api-key", cfg.TRAPIKey, "TrustedRouter API key")
 	fs.StringVar(&cfg.TRBaseURL, "tr-base-url", cfg.TRBaseURL, "TrustedRouter OpenAI-compatible base URL")
+	fs.StringVar(&cfg.TRCatalogURL, "tr-catalog-url", cfg.TRCatalogURL, "TrustedRouter public catalog base URL")
 	fs.IntVar(&cfg.LocalMaxConcurrency, "local-max-concurrency", cfg.LocalMaxConcurrency, "in-flight cap on local upstream")
 	fs.DurationVar(&cfg.LocalQueueWait, "local-queue-wait", cfg.LocalQueueWait, "how long to wait for a local slot before bursting")
 	fs.BoolVar(&cfg.BurstOnError, "burst-on-error", cfg.BurstOnError, "burst to TrustedRouter on local connect error/timeout/429/5xx/404-model")
@@ -71,6 +77,7 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 		fmt.Fprintln(output, "  -local-url                 env BURSTY_LOCAL_URL               default \"\"")
 		fmt.Fprintln(output, "  -tr-api-key                env TRUSTEDROUTER_API_KEY          default \"\"")
 		fmt.Fprintf(output, "  -tr-base-url               env BURSTY_TR_BASE_URL             default %s\n", trustedrouter.DefaultAPIBaseURL)
+		fmt.Fprintf(output, "  -tr-catalog-url            env BURSTY_TR_CATALOG_URL          default %s\n", DefaultTRCatalogURL)
 		fmt.Fprintln(output, "  -local-max-concurrency     env BURSTY_LOCAL_MAX_CONCURRENCY   default 4")
 		fmt.Fprintln(output, "  -local-queue-wait          env BURSTY_LOCAL_QUEUE_WAIT        default 0s")
 		fmt.Fprintln(output, "  -burst-on-error            env BURSTY_BURST_ON_ERROR          default true")
@@ -89,6 +96,7 @@ func defaultsFromEnv(lookupEnv func(string) (string, bool)) (Config, error) {
 	cfg := Config{
 		Listen:              ":8383",
 		TRBaseURL:           trustedrouter.DefaultAPIBaseURL,
+		TRCatalogURL:        DefaultTRCatalogURL,
 		LocalMaxConcurrency: 4,
 		LocalQueueWait:      0,
 		BurstOnError:        true,
@@ -105,6 +113,9 @@ func defaultsFromEnv(lookupEnv func(string) (string, bool)) (Config, error) {
 	}
 	if value, ok := lookupEnv(envTRBaseURL); ok {
 		cfg.TRBaseURL = value
+	}
+	if value, ok := lookupEnv(envTRCatalogURL); ok {
+		cfg.TRCatalogURL = value
 	}
 	if value, ok := lookupEnv(envLocalMaxConcurrency); ok {
 		parsed, err := strconv.Atoi(strings.TrimSpace(value))
