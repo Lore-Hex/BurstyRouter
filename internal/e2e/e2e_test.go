@@ -771,6 +771,67 @@ func TestBinaryBurstOnError(t *testing.T) {
 }
 
 func TestBinarySlowLocalFirstByte(t *testing.T) {
+	t.Run("slow headers hedge before local bytes reach client", func(t *testing.T) {
+		localDone := make(chan struct{})
+		var localBytes atomic.Int64
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(localDone)
+			// Drain the request body as a real local server does, so a client
+			// cancellation propagates to r.Context() (Go does not surface a
+			// cancelled POST-with-unread-body to the handler context otherwise).
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			n, _ := w.Write([]byte("data: local\n\n"))
+			localBytes.Add(int64(n))
+			w.(http.Flusher).Flush()
+		}))
+		defer local.Close()
+
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: tr\n\n"))
+		}))
+		defer tr.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL:       local.URL,
+			trAPIKey:       "e2e-tr-key",
+			trBaseURL:      tr.URL + "/v1",
+			trCatalogURL:   tr.URL + "/v1",
+			localSlowAfter: 20 * time.Millisecond,
+		})
+
+		resp, body := postChatWithTimeout(t, proc, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, nil, 2*time.Second)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "trustedrouter", "burst-slow")
+		if !bytes.Equal(body, []byte("data: tr\n\n")) {
+			t.Fatalf("body = %q, want TrustedRouter stream only", body)
+		}
+		if bytes.Contains(body, []byte("local")) {
+			t.Fatalf("client received local bytes after hedge: %q", body)
+		}
+		if trLog.count() != 1 {
+			t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+		}
+		select {
+		case <-localDone:
+		case <-time.After(time.Second):
+			t.Fatal("local handler did not finish after hedge cancellation")
+		}
+		if got := localBytes.Load(); got != 0 {
+			t.Fatalf("local bytes written after hedge = %d, want 0", got)
+		}
+	})
+
 	t.Run("slow default hedges before local bytes reach client", func(t *testing.T) {
 		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")

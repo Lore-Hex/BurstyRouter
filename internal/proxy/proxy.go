@@ -402,8 +402,48 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 	localCtx, cancelLocal := context.WithCancel(r.Context())
 	defer cancelLocal()
 
-	resp, err := endpoint.localPost(localCtx, decision.LocalBody, r.Header)
+	var (
+		resp             *http.Response
+		err              error
+		errAfterResponse bool
+	)
+	if !forced && s.shouldHedgeSlowLocal(decision) {
+		attempt := startLocalFirstByteAttempt(localCtx, endpoint, decision.LocalBody, r.Header)
+		var slow bool
+		result := attempt.waitWithin(s.cfg.LocalSlowAfter)
+		resp, slow, err, errAfterResponse = result.resp, result.slow, result.err, result.errAfterResponse
+		if slow {
+			switch s.allowAutomaticCloud(w, policy.ReasonBurstSlow) {
+			case cloudAllowed:
+				s.stats.burstsSlow.Add(1)
+				cancelLocal()
+				attempt.closeActiveBody()
+				attempt.closeWhenDone()
+				releaseLocalSlot()
+				s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstSlow, endpoint.family, decision)
+				return
+			case cloudBlockedBudget:
+				cancelLocal()
+				attempt.closeActiveBody()
+				attempt.closeWhenDone()
+				releaseLocalSlot()
+				return
+			case cloudBlockedMode:
+				result = attempt.wait()
+				resp, err, errAfterResponse = result.resp, result.err, result.errAfterResponse
+			}
+		}
+	} else {
+		resp, err = endpoint.localPost(localCtx, decision.LocalBody, r.Header)
+	}
 	if err != nil {
+		if errAfterResponse {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", err.Error(), "api_error")
+			return
+		}
 		if !forced && s.cfg.BurstOnError && s.tr != nil {
 			if decision.BurstAllowed {
 				switch s.allowAutomaticCloud(w, policy.ReasonBurstError) {
@@ -454,37 +494,6 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 
 	if forced && s.cfg.LocalSlowAfter > 0 {
 		resp.Body = logSlowFirstByteReadCloser(resp.Body, s.cfg.LocalSlowAfter, decision.View.Model)
-	} else if s.shouldHedgeSlowLocal(decision, resp) {
-		race := startFirstBodyByteRace(resp.Body)
-		body, slow, err := race.waitWithin(s.cfg.LocalSlowAfter)
-		if err != nil {
-			writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", err.Error(), "api_error")
-			return
-		}
-		resp.Body = body
-		if slow {
-			switch s.allowAutomaticCloud(w, policy.ReasonBurstSlow) {
-			case cloudAllowed:
-				s.stats.burstsSlow.Add(1)
-				cancelLocal()
-				closeBurstResponseBody(resp)
-				releaseLocalSlot()
-				s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstSlow, endpoint.family, decision)
-				return
-			case cloudBlockedBudget:
-				cancelLocal()
-				closeBurstResponseBody(resp)
-				releaseLocalSlot()
-				return
-			case cloudBlockedMode:
-				body, err := race.wait()
-				if err != nil {
-					writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", err.Error(), "api_error")
-					return
-				}
-				resp.Body = body
-			}
-		}
 	}
 
 	s.serveUpstreamResponse(w, r, resp, policy.RouteLocal, decision.Reason, decision.View.Stream, endpoint.family, decision)
@@ -921,11 +930,8 @@ func (s *Server) countSkippedUnmapped(decision policy.Decision) {
 	}
 }
 
-func (s *Server) shouldHedgeSlowLocal(decision policy.Decision, resp *http.Response) bool {
+func (s *Server) shouldHedgeSlowLocal(decision policy.Decision) bool {
 	if s.cfg.LocalSlowAfter <= 0 || s.tr == nil || !decision.BurstAllowed {
-		return false
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return false
 	}
 	if s.cloud != nil && s.cloud.EffectiveMode() != config.CloudAuto {
@@ -1255,6 +1261,90 @@ func closeBurstResponseBody(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
+type localFirstByteAttempt struct {
+	mu   sync.Mutex
+	resp *http.Response
+	body io.ReadCloser
+	done chan localFirstByteResult
+}
+
+type localFirstByteResult struct {
+	resp             *http.Response
+	slow             bool
+	err              error
+	errAfterResponse bool
+}
+
+func startLocalFirstByteAttempt(ctx context.Context, endpoint localCapableEndpoint, body []byte, header http.Header) *localFirstByteAttempt {
+	attempt := &localFirstByteAttempt{
+		done: make(chan localFirstByteResult, 1),
+	}
+	go func() {
+		attempt.done <- attempt.localResponseWithFirstByte(ctx, endpoint, body, header)
+	}()
+	return attempt
+}
+
+func (a *localFirstByteAttempt) localResponseWithFirstByte(ctx context.Context, endpoint localCapableEndpoint, body []byte, header http.Header) localFirstByteResult {
+	resp, err := endpoint.localPost(ctx, body, header)
+	if err != nil {
+		return localFirstByteResult{err: err}
+	}
+	a.setResp(resp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return localFirstByteResult{resp: resp}
+	}
+	bodyWithFirstByte, err := readFirstBodyByte(resp.Body)
+	if err != nil {
+		return localFirstByteResult{resp: resp, err: err, errAfterResponse: true}
+	}
+	resp.Body = bodyWithFirstByte
+	return localFirstByteResult{resp: resp}
+}
+
+func (a *localFirstByteAttempt) setResp(resp *http.Response) {
+	a.mu.Lock()
+	a.resp = resp
+	a.body = resp.Body
+	a.mu.Unlock()
+}
+
+func (a *localFirstByteAttempt) closeActiveBody() {
+	a.mu.Lock()
+	body := a.body
+	a.mu.Unlock()
+	if body != nil {
+		_ = body.Close()
+	}
+}
+
+func (a *localFirstByteAttempt) waitWithin(timeout time.Duration) localFirstByteResult {
+	if timeout <= 0 {
+		return a.wait()
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case result := <-a.done:
+		return result
+	case <-timer.C:
+		return localFirstByteResult{slow: true}
+	}
+}
+
+func (a *localFirstByteAttempt) wait() localFirstByteResult {
+	return <-a.done
+}
+
+func (a *localFirstByteAttempt) closeWhenDone() {
+	go func() {
+		result := <-a.done
+		if result.resp != nil {
+			_ = result.resp.Body.Close()
+		}
+	}()
+}
+
 type firstBodyByteRace struct {
 	body io.ReadCloser
 	done chan firstBodyByteRead
@@ -1279,6 +1369,12 @@ func startFirstBodyByteRace(body io.ReadCloser) *firstBodyByteRace {
 	return race
 }
 
+func readFirstBodyByte(body io.ReadCloser) (io.ReadCloser, error) {
+	var buf [1]byte
+	n, err := body.Read(buf[:])
+	return bodyAfterFirstRead(body, firstBodyByteRead{buf: buf, n: n, err: err})
+}
+
 func (r *firstBodyByteRace) waitWithin(timeout time.Duration) (io.ReadCloser, bool, error) {
 	if timeout <= 0 {
 		return r.body, false, nil
@@ -1294,22 +1390,21 @@ func (r *firstBodyByteRace) waitWithin(timeout time.Duration) (io.ReadCloser, bo
 	}
 }
 
-func (r *firstBodyByteRace) wait() (io.ReadCloser, error) {
-	result := <-r.done
-	return r.bodyAfter(result)
+func (r *firstBodyByteRace) bodyAfter(result firstBodyByteRead) (io.ReadCloser, error) {
+	return bodyAfterFirstRead(r.body, result)
 }
 
-func (r *firstBodyByteRace) bodyAfter(result firstBodyByteRead) (io.ReadCloser, error) {
+func bodyAfterFirstRead(body io.ReadCloser, result firstBodyByteRead) (io.ReadCloser, error) {
 	if result.n > 0 {
 		return readCloser{
-			Reader: io.MultiReader(bytes.NewReader(result.buf[:result.n]), r.body),
-			Closer: r.body,
+			Reader: io.MultiReader(bytes.NewReader(result.buf[:result.n]), body),
+			Closer: body,
 		}, nil
 	}
 	if result.err != nil && !errors.Is(result.err, io.EOF) {
-		return r.body, result.err
+		return body, result.err
 	}
-	return r.body, nil
+	return body, nil
 }
 
 type firstByteLogReadCloser struct {

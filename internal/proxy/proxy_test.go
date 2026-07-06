@@ -1275,6 +1275,57 @@ func TestFirstBodyByteRace(t *testing.T) {
 }
 
 func TestSlowLocalFirstByte(t *testing.T) {
+	t.Run("slow headers eligible local bursts", func(t *testing.T) {
+		localDone := make(chan struct{})
+		var localBytes atomic.Int64
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(localDone)
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			n, _ := w.Write([]byte("data: local\n\n"))
+			localBytes.Add(int64(n))
+		})
+		var trCalls atomic.Int64
+		tr := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: tr\n\n"))
+		})
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRAPIKey:       "tr-key",
+			LocalSlowAfter: 10 * time.Millisecond,
+		}, local, tr)
+
+		resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if resp.Header.Get("X-Bursty-Route") != "trustedrouter" || resp.Header.Get("X-Bursty-Reason") != "burst-slow" {
+			t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+		}
+		if !bytes.Equal(body, []byte("data: tr\n\n")) {
+			t.Fatalf("body = %q, want TrustedRouter stream only", body)
+		}
+		if trCalls.Load() != 1 {
+			t.Fatalf("tr calls = %d, want 1", trCalls.Load())
+		}
+		if got := proxy.stats.burstsSlow.Value(); got != 1 {
+			t.Fatalf("bursts_slow = %d, want 1", got)
+		}
+		select {
+		case <-localDone:
+		case <-time.After(time.Second):
+			t.Fatal("local handler did not finish after hedge cancellation")
+		}
+		if got := localBytes.Load(); got != 0 {
+			t.Fatalf("local bytes written after hedge = %d, want 0", got)
+		}
+	})
+
 	t.Run("slow eligible local bursts", func(t *testing.T) {
 		localDone := make(chan struct{})
 		var localBytes atomic.Int64
@@ -1324,6 +1375,36 @@ func TestSlowLocalFirstByte(t *testing.T) {
 		}
 		if got := localBytes.Load(); got != 0 {
 			t.Fatalf("local bytes written after hedge = %d, want 0", got)
+		}
+	})
+
+	t.Run("headers and first byte within deadline stay local", func(t *testing.T) {
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(20 * time.Millisecond)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: local\n\ndata: done\n\n"))
+		})
+		tr, trCalls := fakeTR(t)
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRAPIKey:       "tr-key",
+			LocalSlowAfter: time.Second,
+		}, local, tr)
+
+		resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if resp.Header.Get("X-Bursty-Route") != "local" || resp.Header.Get("X-Bursty-Reason") != "policy" {
+			t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+		}
+		if !bytes.Equal(body, []byte("data: local\n\ndata: done\n\n")) {
+			t.Fatalf("body = %q, want full local stream", body)
+		}
+		if trCalls.Load() != 0 {
+			t.Fatalf("tr calls = %d, want 0", trCalls.Load())
+		}
+		if got := proxy.stats.burstsSlow.Value(); got != 0 {
+			t.Fatalf("bursts_slow = %d, want 0", got)
 		}
 	})
 
