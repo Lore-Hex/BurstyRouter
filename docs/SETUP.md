@@ -159,7 +159,7 @@ burstyrouter -local-url http://127.0.0.1:11434 \
   -tr-base-url "https://openrouter.ai/api/v1"
 ```
 
-Savings/pricing features use the TrustedRouter catalog. If the configured burst upstream lacks `/v1/messages` or `/v1/responses`, BurstyRouter returns a clean `501 endpoint_not_supported` envelope for those passthrough endpoints.
+Savings/pricing features use the TrustedRouter catalog. If the configured burst upstream lacks `/v1/messages` or `/v1/responses`, BurstyRouter returns a clean `501 endpoint_not_supported` envelope for cloud passthrough requests. Aliased local `/v1/messages` requests do not require the burst upstream to support Anthropic Messages.
 
 ## 3b. Savings And Cloud Controls
 
@@ -242,9 +242,18 @@ curl -is "https://<host>/v1/chat/completions" \
   | awk 'BEGIN{found=0} /^X-Bursty-Route:/ {print; found=1} END{exit found?0:1}'
 ```
 
-### Claude Code And Anthropic SDKs
+### Claude Code On Your GPU / Anthropic SDKs
 
-BurstyRouter forwards `/v1/messages` to TrustedRouter. Local OpenAI servers do not serve this endpoint.
+BurstyRouter can run Claude Code against your local OpenAI-compatible model by translating Anthropic `/v1/messages` to local `/v1/chat/completions`. Add an alias from the Claude model id your client sends to the local model name:
+
+```bash
+export TRUSTEDROUTER_API_KEY="tr_..."
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -alias anthropic/claude-haiku-4.5=qwen2.5-coder:32b
+```
+
+If Claude Code sends a different id, use that exact id on the left side of `-alias`. When local is full or failing and cloud egress is allowed, BurstyRouter bursts the original Anthropic body to TrustedRouter.
 
 ```bash
 export ANTHROPIC_BASE_URL="https://<host>"

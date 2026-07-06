@@ -22,15 +22,25 @@ func extractUsageAndModel(body []byte) usageCapture {
 		Usage *struct {
 			PromptTokens     int64 `json:"prompt_tokens"`
 			CompletionTokens int64 `json:"completion_tokens"`
+			InputTokens      int64 `json:"input_tokens"`
+			OutputTokens     int64 `json:"output_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil || payload.Usage == nil {
 		return usageCapture{Model: payload.Model}
 	}
+	promptTokens := payload.Usage.PromptTokens
+	if promptTokens == 0 {
+		promptTokens = payload.Usage.InputTokens
+	}
+	completionTokens := payload.Usage.CompletionTokens
+	if completionTokens == 0 {
+		completionTokens = payload.Usage.OutputTokens
+	}
 	return usageCapture{
 		Usage: tokenUsage{
-			PromptTokens:     payload.Usage.PromptTokens,
-			CompletionTokens: payload.Usage.CompletionTokens,
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
 		},
 		Model:    payload.Model,
 		HasUsage: true,

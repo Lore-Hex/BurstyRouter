@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Lore-Hex/BurstyRouter/internal/anthropic"
 	"github.com/Lore-Hex/BurstyRouter/internal/config"
 	"github.com/Lore-Hex/BurstyRouter/internal/policy"
 	"github.com/Lore-Hex/BurstyRouter/internal/upstream"
@@ -176,7 +177,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case embeddingsPath:
 		s.handleEmbeddings(w, r)
 	case messagesPath:
-		s.handleTrustedRouterOnly(w, r, endpointMessages, trMessagesPath)
+		s.handleMessages(w, r)
 	case responsesPath:
 		s.handleTrustedRouterOnly(w, r, endpointResponses, trResponsesPath)
 	case modelsPath:
@@ -251,6 +252,63 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			return s.local.Embeddings(ctx, body, header)
 		},
 	})
+}
+
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAnthropicRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+	s.stats.requestsTotal.Add(1)
+
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxInboundBodyBytes))
+	if err != nil {
+		writeAnthropicRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	decision, err := policy.Decide(raw, s.local != nil, s.tr != nil, policy.Options{
+		Aliases:            s.cfg.Aliases,
+		BurstFallbackModel: s.cfg.BurstFallbackModel,
+	})
+	if err != nil {
+		var configErr *policy.ConfigError
+		if errors.As(err, &configErr) {
+			writeAnthropicRoutedError(w, configErr.Route, policy.ReasonPolicy, http.StatusBadGateway, configErr.Message, configErr.Type)
+			return
+		}
+		writeAnthropicRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	if messagesShouldUseCloudPassthrough(decision) {
+		decision.Route = policy.RouteTrustedRouter
+		decision.Reason = policy.ReasonPolicy
+	}
+	if decision.Route == policy.RouteTrustedRouter && s.tr == nil {
+		writeAnthropicRoutedError(w, policy.RouteTrustedRouter, decision.Reason, http.StatusNotImplemented, "/v1/messages requires TrustedRouter for unmapped Claude model ids; use -alias or local/<model> for the local path", "invalid_request_error")
+		return
+	}
+
+	if decision.Reason == policy.ReasonForced {
+		if decision.Route == policy.RouteLocal {
+			s.stats.forcedLocal.Add(1)
+		} else {
+			s.stats.forcedTR.Add(1)
+		}
+	}
+
+	switch decision.Route {
+	case policy.RouteLocal:
+		localBody, err := anthropic.TranslateRequest(decision.LocalBody)
+		if err != nil {
+			writeAnthropicTranslationError(w, policy.RouteLocal, decision.Reason, err)
+			return
+		}
+		s.serveLocalMessages(w, r, decision, localBody)
+	case policy.RouteTrustedRouter:
+		s.serveTrustedRouterRaw(w, r, trMessagesPath, decision.TRBody, decision.View.Stream, decision.Reason, endpointMessages, decision)
+	default:
+		writeAnthropicRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusInternalServerError, "unknown route", "api_error")
+	}
 }
 
 func (s *Server) handleLocalCapable(w http.ResponseWriter, r *http.Request, endpoint localCapableEndpoint) {
@@ -430,6 +488,175 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 	}
 
 	s.serveUpstreamResponse(w, r, resp, policy.RouteLocal, decision.Reason, decision.View.Stream, endpoint.family, decision)
+}
+
+func (s *Server) serveLocalMessages(w http.ResponseWriter, r *http.Request, decision policy.Decision, localBody []byte) {
+	forced := decision.Reason == policy.ReasonForced
+	if s.local == nil {
+		if s.tr != nil {
+			if decision.Reason != policy.ReasonForced && s.cloud != nil && s.cloud.EffectiveMode() != config.CloudAuto {
+				writeAnthropicRoutedError(w, policy.RouteLocal, policy.ReasonPolicy, http.StatusBadGateway, "local upstream is not configured", "api_error")
+				return
+			}
+			s.serveTrustedRouterRaw(w, r, trMessagesPath, decision.TRBody, decision.View.Stream, decision.Reason, endpointMessages, decision)
+			return
+		}
+		writeAnthropicRoutedError(w, policy.RouteLocal, policy.ReasonPolicy, http.StatusBadGateway, "local upstream is not configured", "api_error")
+		return
+	}
+
+	switch s.acquireLocalSlot(r.Context()) {
+	case localSlotCanceled:
+		return
+	case localSlotFull:
+		if !forced && s.tr != nil {
+			if decision.BurstAllowed {
+				switch s.allowAutomaticCloud(w, policy.ReasonBurstFull) {
+				case cloudAllowed:
+					s.stats.burstsFull.Add(1)
+					s.serveTrustedRouterRaw(w, r, trMessagesPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstFull, endpointMessages, decision)
+					return
+				case cloudBlockedBudget:
+					return
+				case cloudBlockedMode:
+				}
+			}
+			s.countSkippedUnmapped(decision)
+		}
+		w.Header().Set("Retry-After", "1")
+		writeAnthropicRoutedError(w, policy.RouteLocal, policy.ReasonBurstFull, http.StatusTooManyRequests, "local upstream is full", "rate_limit_error")
+		return
+	case localSlotAcquired:
+	}
+	var releaseOnce sync.Once
+	releaseLocalSlot := func() {
+		releaseOnce.Do(s.releaseLocalSlot)
+	}
+	defer releaseLocalSlot()
+
+	resp, err := s.local.Chat(r.Context(), localBody, r.Header)
+	if err != nil {
+		if !forced && s.cfg.BurstOnError && s.tr != nil {
+			if decision.BurstAllowed {
+				switch s.allowAutomaticCloud(w, policy.ReasonBurstError) {
+				case cloudAllowed:
+					s.stats.burstsError.Add(1)
+					releaseLocalSlot()
+					s.serveTrustedRouterRaw(w, r, trMessagesPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpointMessages, decision)
+					return
+				case cloudBlockedBudget:
+					return
+				case cloudBlockedMode:
+				}
+			}
+			s.countSkippedUnmapped(decision)
+		}
+		writeAnthropicRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, err.Error(), "api_error")
+		return
+	}
+	defer resp.Body.Close()
+
+	shouldBurst, err := shouldBurstLocalResponse(resp, decision.View.Model)
+	if err != nil {
+		writeAnthropicRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, err.Error(), "api_error")
+		return
+	}
+	if shouldBurst && !forced && s.cfg.BurstOnError && s.tr != nil {
+		if decision.BurstAllowed {
+			switch s.allowAutomaticCloud(w, policy.ReasonBurstError) {
+			case cloudAllowed:
+				s.stats.burstsError.Add(1)
+				closeBurstResponseBody(resp)
+				releaseLocalSlot()
+				s.serveTrustedRouterRaw(w, r, trMessagesPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpointMessages, decision)
+				return
+			case cloudBlockedBudget:
+				closeBurstResponseBody(resp)
+				return
+			case cloudBlockedMode:
+			}
+		}
+		s.countSkippedUnmapped(decision)
+	}
+	if shouldBurst && forced {
+		closeBurstResponseBody(resp)
+		writeAnthropicRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, fmt.Sprintf("local upstream returned status %d", resp.StatusCode), "api_error")
+		return
+	}
+
+	s.serveLocalMessagesResponse(w, r, resp, decision)
+}
+
+func (s *Server) serveLocalMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, decision policy.Decision) {
+	s.stats.countEndpointRoute(endpointMessages, policy.RouteLocal)
+	copyResponseHeaders(w.Header(), resp.Header)
+	setRouteHeaders(w, policy.RouteLocal, decision.Reason)
+
+	streaming := decision.View.Stream || strings.Contains(strings.ToLower(resp.Header.Get("content-type")), "text/event-stream")
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, max404SniffBytes))
+		if err != nil {
+			writeAnthropicRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, err.Error(), "api_error")
+			return
+		}
+		message := fmt.Sprintf("local upstream returned status %d", resp.StatusCode)
+		if extracted, ok := jsonErrorMessage(body); ok && extracted != "" {
+			message = extracted
+		}
+		writeAnthropicRoutedError(w, policy.RouteLocal, decision.Reason, resp.StatusCode, message, "api_error")
+		return
+	}
+
+	if streaming {
+		w.Header().Del("Content-Length")
+		w.Header().Del("Content-Encoding")
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		w.WriteHeader(resp.StatusCode)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		usage, err := anthropic.TranslateStream(resp.Body, flushWriter{w: w, flusher: flusher}, decision.View.Model)
+		if err != nil {
+			log.Printf("bursty anthropic: local stream translation failed: %v", err)
+		}
+		s.recordAnthropicLocalUsage(r.Context(), decision, usage, true)
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		w.Header().Del("Content-Length")
+		w.Header().Del("Content-Encoding")
+		writeAnthropicRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, err.Error(), "api_error")
+		return
+	}
+	translated, usage, err := anthropic.TranslateResponse(body, decision.View.Model)
+	if err != nil {
+		writeAnthropicTranslationError(w, policy.RouteLocal, decision.Reason, err)
+		return
+	}
+	s.recordAnthropicLocalUsage(r.Context(), decision, usage, false)
+	w.Header().Del("Content-Encoding")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprint(len(translated)))
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(translated)
+}
+
+func (s *Server) recordAnthropicLocalUsage(ctx context.Context, decision policy.Decision, usage anthropic.Usage, streaming bool) savingsRecord {
+	capture := usageCapture{}
+	if usage.HasUsage {
+		capture = usageCapture{
+			Usage: tokenUsage{
+				PromptTokens:     usage.PromptTokens,
+				CompletionTokens: usage.CompletionTokens,
+			},
+			Model:    decision.View.Model,
+			HasUsage: true,
+		}
+	}
+	return s.recordResponseUsage(ctx, policy.RouteLocal, decision, capture, streaming)
 }
 
 type cloudAllowance int
@@ -1149,6 +1376,30 @@ func writeRoutedError(w http.ResponseWriter, route policy.Route, reason policy.R
 	writeError(w, status, code, message, typ)
 }
 
+func writeAnthropicTranslationError(w http.ResponseWriter, route policy.Route, reason policy.Reason, err error) {
+	var anthropicErr *anthropic.Error
+	if errors.As(err, &anthropicErr) {
+		writeAnthropicRoutedError(w, route, reason, anthropicErr.Status, anthropicErr.Message, anthropicErr.Type)
+		return
+	}
+	writeAnthropicRoutedError(w, route, reason, http.StatusBadGateway, err.Error(), "api_error")
+}
+
+func writeAnthropicRoutedError(w http.ResponseWriter, route policy.Route, reason policy.Reason, status int, message, typ string) {
+	setRouteHeaders(w, route, reason)
+	writeAnthropicError(w, status, message, typ)
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, message, typ string) {
+	writeJSON(w, status, map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    typ,
+			"message": message,
+		},
+	})
+}
+
 func writeError(w http.ResponseWriter, status int, code, message, typ string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
@@ -1158,6 +1409,24 @@ func writeError(w http.ResponseWriter, status int, code, message, typ string) {
 			"source":  "bursty",
 		},
 	})
+}
+
+func messagesShouldUseCloudPassthrough(decision policy.Decision) bool {
+	if decision.Route != policy.RouteLocal {
+		return false
+	}
+	if decision.Reason == policy.ReasonForced || decision.AliasKey != "" {
+		return false
+	}
+	return cloudClaudeModelID(decision.View.Model)
+}
+
+func cloudClaudeModelID(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" || strings.HasPrefix(model, "local/") || !strings.Contains(model, "/") {
+		return false
+	}
+	return strings.Contains(model, "claude")
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
