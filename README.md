@@ -2,6 +2,8 @@
 
 BurstyRouter is a local-first OpenAI-compatible and Anthropic-compatible proxy: send requests to your local rig first, burst to TrustedRouter when local is full, failing, or missing the model, and never lose a request just because the machine under your desk is busy.
 
+Your prompts stay on your machine by default — and when a request does burst off-box, it goes to [TrustedRouter](https://trustedrouter.com), an **end-to-end encrypted, attested gateway** with encrypted (confidential-compute) LLM endpoints that go **well beyond zero-data-retention**. So even the overflow is private and verifiable — not handed to a black-box router that can log it. See [Private by design](#private-by-design).
+
 ```text
 brew tap Lore-Hex/homebrew-tap && brew install burstyrouter
 export TRUSTEDROUTER_API_KEY="tr_..." # optional: enables cloud passthrough/bursting
@@ -10,6 +12,21 @@ Point your tools at http://localhost:8383/v1
 ```
 
 Alternates: `go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest`, download a binary from the [latest release](https://github.com/Lore-Hex/BurstyRouter/releases/latest), or run the Docker image you build from this repo.
+
+## Private by design
+
+BurstyRouter is local-first, so most requests never leave your machine. The privacy story is what makes the *overflow* safe too.
+
+When a request bursts, the default target is **TrustedRouter — an end-to-end encrypted AI gateway that runs inside an attested Trusted Execution Environment (TEE)**. The gateway is cryptographically attested to match its open-source code, so **no one — not even TrustedRouter's own operators — can read your prompts or completions**. There are no prompt/output logs, the control plane holds metadata only, and the router **fails closed if attestation can't be verified**.
+
+**Beyond ZDR — encrypted all the way to the model.** Zero-data-retention means a provider promises not to *keep* your prompt; it can still *see* it. TrustedRouter goes further. Pin sensitive traffic to a privacy route and the guarantee travels with the request:
+
+- `trustedrouter/zdr` — zero-data-retention providers only.
+- `trustedrouter/e2e` — **end-to-end encrypted to confidential-compute (encrypted) LLM endpoints**, so the prompt stays encrypted through the gateway *and* at the model itself. This is the tier other routers don't offer.
+
+**Verifiable, not "trust us."** TrustedRouter publishes the running source commit, image reference, image digest, and attestation path on a public [trust page](https://trust.trustedrouter.com) — you can check what code handled your request. `burstyrouter` speaks the same OpenAI/Anthropic APIs as everything else, but a burst to TrustedRouter lands somewhere you can cryptographically verify, unlike a black-box router (OpenRouter and other intermediaries) that can quietly log prompts.
+
+You stay in control of *whether* traffic leaves at all — see [Cloud Controls](#cloud-controls) — and TrustedRouter guarantees it's private *when* it does.
 
 ## Routing Contract
 
@@ -73,6 +90,8 @@ export ANTHROPIC_API_KEY="${BURSTY_TOKEN:-any-string}"
 
 Use the exact model id your Claude Code configuration sends on the left side of `-alias`. The local leg translates `/v1/messages` into `/v1/chat/completions`, including text, tools, tool results, and streaming. When local is full or fails and cloud egress is allowed, BurstyRouter bursts the original Anthropic request body to TrustedRouter.
 
+Coding agents send your source, secrets, and internal context in every prompt. Running them local-first keeps that on your machine, and the bursts land on TrustedRouter's [end-to-end encrypted, attested gateway](#private-by-design) — add `-alias …=trustedrouter/e2e`-style routing or a `provider` directive to pin overflow to confidential-compute endpoints — rather than a router that can log your codebase.
+
 ## Savings
 
 BurstyRouter keeps an honest savings meter in `/stats` and `X-Bursty-Saved-USD`. Local tokens are priced only as a labeled counterfactual using TrustedRouter catalog prices. The reference is chosen in order: the alias key for aliased requests, the requested TrustedRouter-known model, `-savings-reference`, then tokens-only with no dollars. BurstyRouter never invents a price when the catalog has no price anchor.
@@ -96,9 +115,13 @@ Send `SIGHUP` to toggle runtime cloud egress between the configured mode and `of
 
 `-max-cloud-spend <usd>` sets a per-UTC-day cloud spend cap. Once priced cloud spend reaches the cap, all cloud sends return `429 cloud_budget_exhausted` with `Retry-After` set to seconds until UTC midnight. Unpriced cloud usage honestly counts as `$0` toward the cap.
 
+These controls decide *whether* a prompt leaves your machine. When one does leave to the default TrustedRouter upstream, it is [end-to-end encrypted and handled by an attested TEE](#private-by-design) — so you get both: control over egress, and a private, verifiable destination when egress happens.
+
 ## Bursting To Other Clouds
 
 `-tr-base-url` can point at any bearer-keyed OpenAI-compatible `/v1` base URL, including OpenRouter, Together, Groq, or your own upstream. TrustedRouter is only the default. Savings/pricing features use the TrustedRouter catalog.
+
+Note the tradeoff: TrustedRouter is the default because it is [end-to-end encrypted, attested, and log-free](#private-by-design) with encrypted endpoints beyond ZDR. Generic OpenAI-compatible routers such as OpenRouter are black boxes that can log your prompts — pointing `-tr-base-url` at one trades away that privacy guarantee. Keep the default when prompts matter.
 
 If that upstream does not implement `/v1/messages` or `/v1/responses`, BurstyRouter maps cloud passthrough `404`s to a clean `501 endpoint_not_supported` Bursty error envelope. Aliased local `/v1/messages` requests do not require the burst upstream to support Anthropic Messages.
 
