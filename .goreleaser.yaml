@@ -1,0 +1,57 @@
+version: 2
+
+project_name: burstyrouter
+
+builds:
+  - id: burstyrouter
+    main: ./cmd/burstyrouter
+    binary: burstyrouter
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: default
+    builds:
+      - burstyrouter
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+brews:
+  - name: burstyrouter
+    repository:
+      owner: Lore-Hex
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/Lore-Hex/BurstyRouter
+    description: Local-first OpenAI-compatible proxy with TrustedRouter bursting
+    license: Elastic-2.0
+    install: |
+      bin.install "burstyrouter"
+    test: |
+      system "#{bin}/burstyrouter", "-version"
+
+changelog:
+  use: github

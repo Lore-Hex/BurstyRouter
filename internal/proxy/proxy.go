@@ -62,6 +62,14 @@ const (
 	localSlotCanceled
 )
 
+// SavingsTotals summarizes loaded savings state for startup display.
+type SavingsTotals struct {
+	SavedUSDMicro      int64
+	CloudSpendUSDMicro int64
+	TopReference       string
+	HasHistory         bool
+}
+
 // Server is the BurstyRouter HTTP proxy.
 type Server struct {
 	cfg        config.Config
@@ -532,6 +540,20 @@ func (s *Server) Close() {
 func (s *Server) HandleSIGHUP() {
 	if s.cloud != nil {
 		s.cloud.HandleSIGHUP()
+	}
+}
+
+// SavingsTotals returns loaded savings totals for startup display.
+func (s *Server) SavingsTotals() SavingsTotals {
+	if s.savings == nil {
+		return SavingsTotals{}
+	}
+	saved, cloudSpend, ref := s.savings.Totals()
+	return SavingsTotals{
+		SavedUSDMicro:      saved,
+		CloudSpendUSDMicro: cloudSpend,
+		TopReference:       ref,
+		HasHistory:         s.savings.HasHistory(),
 	}
 }
 

@@ -3,11 +3,13 @@
 BurstyRouter is a local-first OpenAI-compatible proxy: send requests to your local rig first, burst to TrustedRouter when local is full, failing, or missing the model, and never lose a request just because the machine under your desk is busy.
 
 ```text
-go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest
-burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY"
-point your tool at http://localhost:8383/v1
-done
+brew tap Lore-Hex/homebrew-tap && brew install burstyrouter
+export TRUSTEDROUTER_API_KEY="tr_..." # optional: enables cloud passthrough/bursting
+burstyrouter
+Point your tools at http://localhost:8383/v1
 ```
+
+Alternates: `go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest`, download a binary from the [latest release](https://github.com/Lore-Hex/BurstyRouter/releases/latest), or run the Docker image you build from this repo.
 
 ## Routing Contract
 
@@ -43,9 +45,11 @@ done
 | `-state-file` | `BURSTY_STATE_FILE` | `$XDG_STATE_HOME/bursty/state.json` or `~/.bursty/state.json`; `""` disables |
 | `-cloud` | `BURSTY_CLOUD` | `auto` |
 | `-max-cloud-spend` | `BURSTY_MAX_CLOUD_SPEND` | `0` |
+| `-no-autodetect` | none | `false` |
+| `-version` | none | `false` |
 | `-token` | `BURSTY_TOKEN` | `""` |
 
-At least one of `-local-url` or `-tr-api-key` is required. Set `BURSTY_TOKEN` whenever the proxy is reachable outside localhost. Auth accepts either `Authorization: Bearer <token>` or `x-api-key: <token>`.
+When `-local-url` is unset, BurstyRouter probes `OLLAMA_HOST`, Ollama, LM Studio, llama.cpp, and vLLM on common localhost ports. If no local server is found, `TRUSTEDROUTER_API_KEY` enables pure cloud passthrough; without either, startup prints an actionable error. Use `-no-autodetect` to disable local probing. Set `BURSTY_TOKEN` whenever the proxy is reachable outside localhost. Auth accepts either `Authorization: Bearer <token>` or `x-api-key: <token>`.
 
 Aliases map cloud-facing ids to local model ids. For example, `-alias gpt-4o=qwen2.5-coder:32b` lets tools request `gpt-4o`; local receives `qwen2.5-coder:32b`, while bursts still send `gpt-4o`.
 

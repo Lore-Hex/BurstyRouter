@@ -63,6 +63,8 @@ type Config struct {
 	StateFile           string
 	Cloud               CloudMode
 	MaxCloudSpendMicro  int64
+	NoAutodetect        bool
+	PrintVersion        bool
 }
 
 // HasLocal reports whether local upstream routing is configured.
@@ -100,6 +102,8 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 	fs.StringVar(&cfg.StateFile, "state-file", cfg.StateFile, "state file path; empty disables persistence")
 	fs.Var(cloudModeValue{value: &cfg.Cloud}, "cloud", "cloud egress mode: auto, explicit, or off")
 	fs.Var(usdMicroValue{value: &cfg.MaxCloudSpendMicro}, "max-cloud-spend", "maximum cloud spend in USD per UTC day; 0 disables the cap")
+	fs.BoolVar(&cfg.NoAutodetect, "no-autodetect", cfg.NoAutodetect, "disable local server autodetection when -local-url is unset")
+	fs.BoolVar(&cfg.PrintVersion, "version", cfg.PrintVersion, "print version and exit")
 	fs.Usage = func() {
 		fmt.Fprintln(output, "Usage: burstyrouter [flags]")
 		fmt.Fprintln(output)
@@ -119,6 +123,8 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 		fmt.Fprintln(output, "  -state-file                env BURSTY_STATE_FILE              default $XDG_STATE_HOME/bursty/state.json or ~/.bursty/state.json")
 		fmt.Fprintln(output, "  -cloud                     env BURSTY_CLOUD                   default auto")
 		fmt.Fprintln(output, "  -max-cloud-spend           env BURSTY_MAX_CLOUD_SPEND         default 0")
+		fmt.Fprintln(output, "  -no-autodetect             env none                           default false")
+		fmt.Fprintln(output, "  -version                   env none                           default false")
 	}
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -212,9 +218,6 @@ func defaultsFromEnv(lookupEnv func(string) (string, bool)) (Config, error) {
 }
 
 func validate(cfg Config) error {
-	if strings.TrimSpace(cfg.LocalURL) == "" && strings.TrimSpace(cfg.TRAPIKey) == "" {
-		return errors.New("at least one of -local-url or -tr-api-key is required")
-	}
 	if strings.TrimSpace(cfg.Listen) == "" {
 		return errors.New("-listen must not be empty")
 	}
@@ -231,6 +234,18 @@ func validate(cfg Config) error {
 		return errors.New("-max-cloud-spend must not be negative")
 	}
 	return nil
+}
+
+// ValidateRuntime verifies the final startup configuration after local
+// autodetection has had a chance to populate LocalURL.
+func ValidateRuntime(cfg Config) error {
+	if strings.TrimSpace(cfg.LocalURL) != "" || strings.TrimSpace(cfg.TRAPIKey) != "" {
+		return nil
+	}
+	if cfg.NoAutodetect {
+		return errors.New("no upstream configured: pass -local-url http://127.0.0.1:11434, set TRUSTEDROUTER_API_KEY, or remove -no-autodetect to probe local servers")
+	}
+	return errors.New("no local OpenAI-compatible server found and TRUSTEDROUTER_API_KEY is unset: start Ollama, LM Studio, llama.cpp, or vLLM; pass -local-url; or set TRUSTEDROUTER_API_KEY for cloud passthrough")
 }
 
 func defaultStateFile(lookupEnv func(string) (string, bool)) string {

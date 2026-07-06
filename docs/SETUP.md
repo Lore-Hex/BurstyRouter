@@ -5,28 +5,42 @@ This is the linear reference. For an interactive agent flow, use `skills/bursty-
 ## 1. Install
 
 ```bash
-go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest
+brew tap Lore-Hex/homebrew-tap
+brew install burstyrouter
 ```
 
-Or download the latest release binary from:
+Or download the latest release binary:
 
 ```text
 https://github.com/Lore-Hex/BurstyRouter/releases/latest
 ```
 
-## 2. Run
-
-Local-only with Ollama:
+Other install paths:
 
 ```bash
-burstyrouter -local-url http://127.0.0.1:11434
+go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest
+docker build -t burstyrouter:local .
+```
+
+## 2. Run
+
+Local-only with Ollama, LM Studio, llama.cpp, or vLLM on a common localhost port:
+
+```bash
+burstyrouter
 ```
 
 Local plus TrustedRouter burst:
 
 ```bash
 export TRUSTEDROUTER_API_KEY="tr_..."
-burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY"
+burstyrouter -tr-api-key "$TRUSTEDROUTER_API_KEY"
+```
+
+Explicit local URL:
+
+```bash
+burstyrouter -local-url http://127.0.0.1:11434
 ```
 
 Local plus aliases for tool-facing cloud model names:
@@ -46,7 +60,7 @@ TrustedRouter-only:
 
 ```bash
 export TRUSTEDROUTER_API_KEY="tr_..."
-burstyrouter -tr-api-key "$TRUSTEDROUTER_API_KEY"
+burstyrouter -no-autodetect -tr-api-key "$TRUSTEDROUTER_API_KEY"
 ```
 
 If the proxy is reachable from the internet, require a bearer token:
@@ -57,6 +71,33 @@ burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_K
 ```
 
 Clients may authenticate with either `Authorization: Bearer $BURSTY_TOKEN` or `x-api-key: $BURSTY_TOKEN`.
+
+## 2a. Docker Compose With Ollama
+
+From the repository root:
+
+```yaml
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  burstyrouter:
+    build: .
+    depends_on:
+      - ollama
+    environment:
+      BURSTY_LOCAL_URL: http://ollama:11434
+      TRUSTEDROUTER_API_KEY: ${TRUSTEDROUTER_API_KEY:-}
+    ports:
+      - "8383:8383"
+
+volumes:
+  ollama:
+```
 
 ## 3. Verify
 
