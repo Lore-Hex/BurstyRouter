@@ -1,6 +1,6 @@
 # BurstyRouter
 
-BurstyRouter is a local-first OpenAI-compatible proxy: send requests to your local rig first, burst to TrustedRouter when local is full, failing, or missing the model, and never lose a request just because the machine under your desk is busy.
+BurstyRouter is a local-first OpenAI-compatible and Anthropic-compatible proxy: send requests to your local rig first, burst to TrustedRouter when local is full, failing, or missing the model, and never lose a request just because the machine under your desk is busy.
 
 ```text
 go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest
@@ -23,7 +23,9 @@ done
 | Local-native id with `-burst-fallback-model` set | Can burst; BurstyRouter substitutes the fallback model only in the burst body. |
 | Local semaphore full | Bursts to TrustedRouter when not forced, TR is configured, and the model is burst-capable; otherwise returns `429`. |
 | Local connect error, `429`, `5xx`, or model-missing `404` | Bursts to TrustedRouter when `-burst-on-error=true`, not forced, TR is configured, and the model is burst-capable. |
-| `/v1/messages` or `/v1/responses` | TrustedRouter-only raw passthrough; local-forced requests return `400`, local-only mode returns `501`, and upstream `404` maps to a Bursty `501`. |
+| `/v1/messages` with an alias or `local/<name>` | Local-capable: translates Anthropic Messages to local OpenAI chat/completions, then translates the response back. Bursts send the original Anthropic body. |
+| `/v1/messages` with an unmapped Claude cloud id | Raw TrustedRouter passthrough, preserving the Anthropic body. |
+| `/v1/responses` | TrustedRouter-only raw passthrough; local-forced requests return `400`, local-only mode returns `501`, and upstream `404` maps to a Bursty `501`. |
 
 ## Configuration
 
@@ -48,6 +50,22 @@ done
 At least one of `-local-url` or `-tr-api-key` is required. Set `BURSTY_TOKEN` whenever the proxy is reachable outside localhost. Auth accepts either `Authorization: Bearer <token>` or `x-api-key: <token>`.
 
 Aliases map cloud-facing ids to local model ids. For example, `-alias gpt-4o=qwen2.5-coder:32b` lets tools request `gpt-4o`; local receives `qwen2.5-coder:32b`, while bursts still send `gpt-4o`.
+
+## Claude Code On Your GPU
+
+Claude Code and Anthropic SDKs can point at BurstyRouter directly. Map the Claude model id your tool sends to a local OpenAI-compatible model:
+
+```bash
+export TRUSTEDROUTER_API_KEY="tr_..."
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -alias anthropic/claude-haiku-4.5=qwen2.5-coder:32b
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8383"
+export ANTHROPIC_API_KEY="${BURSTY_TOKEN:-any-string}"
+```
+
+Use the exact model id your Claude Code configuration sends on the left side of `-alias`. The local leg translates `/v1/messages` into `/v1/chat/completions`, including text, tools, tool results, and streaming. When local is full or fails and cloud egress is allowed, BurstyRouter bursts the original Anthropic request body to TrustedRouter.
 
 ## Savings
 
@@ -76,7 +94,7 @@ Send `SIGHUP` to toggle runtime cloud egress between the configured mode and `of
 
 `-tr-base-url` can point at any bearer-keyed OpenAI-compatible `/v1` base URL, including OpenRouter, Together, Groq, or your own upstream. TrustedRouter is only the default. Savings/pricing features use the TrustedRouter catalog.
 
-If that upstream does not implement `/v1/messages` or `/v1/responses`, BurstyRouter maps its `404` to a clean `501 endpoint_not_supported` Bursty error envelope.
+If that upstream does not implement `/v1/messages` or `/v1/responses`, BurstyRouter maps cloud passthrough `404`s to a clean `501 endpoint_not_supported` Bursty error envelope. Aliased local `/v1/messages` requests do not require the burst upstream to support Anthropic Messages.
 
 ## Endpoints
 
@@ -87,7 +105,7 @@ If that upstream does not implement `/v1/messages` or `/v1/responses`, BurstyRou
 | `GET /v1/models` | Merged local and TrustedRouter model list. |
 | `POST /v1/chat/completions` | Local-capable, burst-capable. |
 | `POST /v1/embeddings` | Local-capable, burst-capable. |
-| `POST /v1/messages` | TrustedRouter-only raw passthrough. |
+| `POST /v1/messages` | Local-capable Anthropic Messages translation; raw TrustedRouter passthrough for cloud. |
 | `POST /v1/responses` | TrustedRouter-only raw passthrough. |
 
 ## Responses

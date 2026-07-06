@@ -17,12 +17,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 const (
-	chatPath = "/v1/chat/completions"
+	chatPath     = "/v1/chat/completions"
+	messagesPath = "/v1/messages"
 )
 
 var (
@@ -335,6 +337,229 @@ func TestBinaryAliasRoutingModelsAndBurst(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestBinaryMessagesLocalTranslation(t *testing.T) {
+	localLog := &requestLog{}
+	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localLog.add(r)
+		if r.URL.Path != chatPath {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unexpected local path"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"model": "llama3",
+			"choices": []map[string]any{{
+				"message":       map[string]any{"content": "pong"},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]int{"prompt_tokens": 8, "completion_tokens": 2},
+		})
+	}))
+	defer local.Close()
+
+	proc := startBursty(t, burstyConfig{
+		localURL: local.URL,
+		aliases:  []string{"anthropic/claude-haiku-4.5=llama3"},
+	})
+
+	resp, body := postMessages(t, proc, `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	assertRoute(t, resp, "local", "policy")
+	assertTopLevelString(t, localLog.last(t).Body, "model", "llama3")
+	assertAnthropicMessageText(t, body, "anthropic/claude-haiku-4.5", "pong", 8, 2)
+}
+
+func TestBinaryMessagesStreamingTranslation(t *testing.T) {
+	localLog := &requestLog{}
+	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localLog.add(r)
+		if r.URL.Path != chatPath {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unexpected local path"})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer local.Close()
+
+	proc := startBursty(t, burstyConfig{
+		localURL: local.URL,
+		aliases:  []string{"anthropic/claude-haiku-4.5=llama3"},
+	})
+
+	resp, err := openMessagesWithTimeout(t, proc, `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"ping"}]}`, nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("open messages stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, data)
+	}
+	assertRoute(t, resp, "local", "policy")
+	assertTopLevelBool(t, localLog.last(t).Body, "stream_options", "include_usage", true)
+
+	reader := bufio.NewReader(resp.Body)
+	wantOrder := []string{
+		"event: message_start",
+		"event: content_block_start",
+		`"type":"text_delta","text":"hi"`,
+		"event: content_block_stop",
+		`"stop_reason":"end_turn"`,
+		"event: message_stop",
+	}
+	for _, want := range wantOrder {
+		event := readSSEEventWithin(t, reader, time.Second)
+		if !strings.Contains(event, want) {
+			t.Fatalf("event = %q, want to contain %q", event, want)
+		}
+	}
+}
+
+func TestBinaryMessagesToolRoundTrip(t *testing.T) {
+	var calls atomic.Int64
+	secondBody := make(chan []byte, 1)
+	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != chatPath {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unexpected local path"})
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if calls.Add(1) == 1 {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"content": "",
+						"tool_calls": []map[string]any{{
+							"id":   "call_1",
+							"type": "function",
+							"function": map[string]string{
+								"name":      "lookup",
+								"arguments": `{"q":"ping"}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+				"usage": map[string]int{"prompt_tokens": 9, "completion_tokens": 1},
+			})
+			return
+		}
+		secondBody <- body
+		writeJSON(w, http.StatusOK, map[string]any{
+			"choices": []map[string]any{{
+				"message":       map[string]any{"content": "done"},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer local.Close()
+
+	proc := startBursty(t, burstyConfig{
+		localURL: local.URL,
+		aliases:  []string{"anthropic/claude-haiku-4.5=llama3"},
+	})
+
+	resp, body := postMessages(t, proc, `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"ping"}]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d body=%s", resp.StatusCode, body)
+	}
+	assertAnthropicToolUse(t, body, "call_1", "lookup")
+
+	second := `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"messages":[` +
+		`{"role":"user","content":"ping"},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"ping"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"pong"}]}]}` +
+		`]}`
+	resp, body = postMessages(t, proc, second, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second status = %d body=%s", resp.StatusCode, body)
+	}
+	assertAnthropicMessageText(t, body, "anthropic/claude-haiku-4.5", "done", 0, 0)
+	assertTranslatedToolResultBody(t, <-secondBody)
+}
+
+func TestBinaryMessagesBurstOnFullRawBody(t *testing.T) {
+	enteredLocal := make(chan struct{})
+	releaseLocal := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseLocal) })
+	}
+	defer release()
+
+	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enterOnce.Do(func() { close(enteredLocal) })
+		<-releaseLocal
+		writeJSON(w, http.StatusOK, map[string]any{
+			"choices": []map[string]any{{
+				"message":       map[string]any{"content": "local"},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer local.Close()
+
+	trLog := &requestLog{}
+	tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		trLog.add(r)
+		if r.URL.Path != messagesPath {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unexpected trustedrouter path"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+	}))
+	defer tr.Close()
+
+	proc := startBursty(t, burstyConfig{
+		localURL:            local.URL,
+		trAPIKey:            "e2e-tr-key",
+		trBaseURL:           tr.URL + "/v1",
+		trCatalogURL:        tr.URL + "/v1",
+		localMaxConcurrency: 1,
+		aliases:             []string{"anthropic/claude-haiku-4.5=llama3"},
+	})
+
+	raw := `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`
+	firstDone := make(chan error, 1)
+	go func() {
+		resp, body, err := doResult(proc, http.MethodPost, messagesPath, raw, nil, 5*time.Second)
+		if err != nil {
+			firstDone <- err
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			firstDone <- fmt.Errorf("first status = %d body=%s", resp.StatusCode, body)
+			return
+		}
+		firstDone <- nil
+	}()
+	select {
+	case <-enteredLocal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not reach local")
+	}
+
+	resp, body := postMessages(t, proc, raw, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("burst status = %d body=%s", resp.StatusCode, body)
+	}
+	assertRoute(t, resp, "trustedrouter", "burst-full")
+	if got := trLog.last(t).Body; !bytes.Equal(got, []byte(raw)) {
+		t.Fatalf("trustedrouter body = %s, want byte-identical %s", got, raw)
+	}
+
+	release()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestBinaryUnmappedLocalModelSuppressionAndFallback(t *testing.T) {
@@ -1354,6 +1579,11 @@ func postChat(t *testing.T, proc *burstyProcess, body string, headers http.Heade
 	return do(t, proc, http.MethodPost, chatPath, body, headers)
 }
 
+func postMessages(t *testing.T, proc *burstyProcess, body string, headers http.Header) (*http.Response, []byte) {
+	t.Helper()
+	return do(t, proc, http.MethodPost, messagesPath, body, headers)
+}
+
 func postChatWithTimeout(t *testing.T, proc *burstyProcess, body string, headers http.Header, timeout time.Duration) (*http.Response, []byte) {
 	t.Helper()
 	return doWithTimeout(t, proc, http.MethodPost, chatPath, body, headers, timeout)
@@ -1414,6 +1644,25 @@ func openChatWithTimeout(t *testing.T, proc *burstyProcess, body string, headers
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proc.baseURL+chatPath, strings.NewReader(body))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	addHeaders(req.Header, headers)
+	resp, err := proc.client.Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+func openMessagesWithTimeout(t *testing.T, proc *burstyProcess, body string, headers http.Header, timeout time.Duration) (*http.Response, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proc.baseURL+messagesPath, strings.NewReader(body))
 	if err != nil {
 		cancel()
 		return nil, err
@@ -1506,6 +1755,95 @@ func assertBurstyBlock(t *testing.T, body []byte, route, reason string) {
 	}
 	if payload.Bursty.Route != route || payload.Bursty.Reason != reason {
 		t.Fatalf("bursty block = %#v, want %s/%s body=%s", payload.Bursty, route, reason, body)
+	}
+}
+
+func assertAnthropicMessageText(t *testing.T, body []byte, model, text string, inputTokens, outputTokens int64) {
+	t.Helper()
+	var payload struct {
+		Type    string `json:"type"`
+		Role    string `json:"role"`
+		Model   string `json:"model"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("Anthropic message JSON: %v\n%s", err, body)
+	}
+	if payload.Type != "message" || payload.Role != "assistant" || payload.Model != model {
+		t.Fatalf("message envelope = %#v, want assistant message model %q; body=%s", payload, model, body)
+	}
+	if len(payload.Content) != 1 || payload.Content[0].Type != "text" || payload.Content[0].Text != text {
+		t.Fatalf("content = %#v, want text %q; body=%s", payload.Content, text, body)
+	}
+	if payload.Usage.InputTokens != inputTokens || payload.Usage.OutputTokens != outputTokens {
+		t.Fatalf("usage = %#v, want input=%d output=%d; body=%s", payload.Usage, inputTokens, outputTokens, body)
+	}
+}
+
+func assertAnthropicToolUse(t *testing.T, body []byte, id, name string) {
+	t.Helper()
+	var payload struct {
+		Content []struct {
+			Type  string         `json:"type"`
+			ID    string         `json:"id"`
+			Name  string         `json:"name"`
+			Input map[string]any `json:"input"`
+		} `json:"content"`
+		StopReason string `json:"stop_reason"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("Anthropic message JSON: %v\n%s", err, body)
+	}
+	if payload.StopReason != "tool_use" {
+		t.Fatalf("stop_reason = %q, want tool_use; body=%s", payload.StopReason, body)
+	}
+	if len(payload.Content) != 1 || payload.Content[0].Type != "tool_use" || payload.Content[0].ID != id || payload.Content[0].Name != name {
+		t.Fatalf("tool content = %#v, want %s/%s; body=%s", payload.Content, id, name, body)
+	}
+	if got, _ := payload.Content[0].Input["q"].(string); got != "ping" {
+		t.Fatalf("tool input q = %q, want ping; body=%s", got, body)
+	}
+}
+
+func assertTranslatedToolResultBody(t *testing.T, body []byte) {
+	t.Helper()
+	var payload struct {
+		Messages []struct {
+			Role       string `json:"role"`
+			Content    any    `json:"content"`
+			ToolCallID string `json:"tool_call_id"`
+			ToolCalls  []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("local request JSON: %v\n%s", err, body)
+	}
+	if len(payload.Messages) != 3 {
+		t.Fatalf("messages = %#v, want 3 in %s", payload.Messages, body)
+	}
+	assistant := payload.Messages[1]
+	if assistant.Role != "assistant" || assistant.Content != "" || len(assistant.ToolCalls) != 1 {
+		t.Fatalf("assistant tool message = %#v in %s", assistant, body)
+	}
+	if assistant.ToolCalls[0].ID != "call_1" || assistant.ToolCalls[0].Function.Name != "lookup" || assistant.ToolCalls[0].Function.Arguments != `{"q":"ping"}` {
+		t.Fatalf("assistant tool call = %#v in %s", assistant.ToolCalls[0], body)
+	}
+	tool := payload.Messages[2]
+	if tool.Role != "tool" || tool.ToolCallID != "call_1" || tool.Content != "pong" {
+		t.Fatalf("tool result message = %#v in %s", tool, body)
 	}
 }
 

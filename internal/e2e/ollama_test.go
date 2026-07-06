@@ -78,6 +78,58 @@ func TestRealOllamaLocalModel(t *testing.T) {
 		t.Fatal("stream did not include terminal [DONE]")
 	}
 
+	messagesBody := mustJSON(t, map[string]any{
+		"model":      model,
+		"max_tokens": 8,
+		"messages": []map[string]string{
+			{"role": "user", "content": "Reply with one short word."},
+		},
+	})
+	resp, body = doWithTimeout(t, proc, http.MethodPost, messagesPath, messagesBody, nil, 90*time.Second)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("messages non-streaming status = %d body=%s", resp.StatusCode, body)
+	}
+	assertRoute(t, resp, "local", "policy")
+	var message struct {
+		Type    string `json:"type"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(body, &message); err != nil {
+		t.Fatalf("messages JSON: %v\n%s", err, body)
+	}
+	if message.Type != "message" || len(message.Content) == 0 {
+		t.Fatalf("messages response has no content: %s", body)
+	}
+
+	messagesStreamBody := mustJSON(t, map[string]any{
+		"model":      model,
+		"max_tokens": 8,
+		"stream":     true,
+		"messages": []map[string]string{
+			{"role": "user", "content": "Reply with one short word."},
+		},
+	})
+	messagesStreamResp, err := openMessagesWithTimeout(t, proc, messagesStreamBody, nil, 90*time.Second)
+	if err != nil {
+		t.Fatalf("open messages stream: %v", err)
+	}
+	defer messagesStreamResp.Body.Close()
+	if messagesStreamResp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(messagesStreamResp.Body)
+		t.Fatalf("messages streaming status = %d body=%s", messagesStreamResp.StatusCode, data)
+	}
+	assertRoute(t, messagesStreamResp, "local", "policy")
+	sawAnthropicDelta, sawAnthropicStop := readAnthropicStream(t, bufio.NewReader(messagesStreamResp.Body), 90*time.Second)
+	if !sawAnthropicDelta {
+		t.Fatal("messages stream did not include a text_delta")
+	}
+	if !sawAnthropicStop {
+		t.Fatal("messages stream did not include message_stop")
+	}
+
 	resp, body = get(t, proc, "/v1/models", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("models status = %d body=%s", resp.StatusCode, body)
@@ -150,6 +202,39 @@ func readOpenAIStream(t *testing.T, reader *bufio.Reader, timeout time.Duration)
 			}
 			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
 				sawDelta = true
+			}
+		}
+	}
+	return sawDelta, false
+}
+
+func readAnthropicStream(t *testing.T, reader *bufio.Reader, timeout time.Duration) (bool, bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	sawDelta := false
+	for time.Now().Before(deadline) {
+		event := readSSEEventWithin(t, reader, time.Until(deadline))
+		for _, line := range strings.Split(event, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			var payload struct {
+				Type  string `json:"type"`
+				Delta struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &payload); err != nil {
+				continue
+			}
+			if payload.Type == "content_block_delta" && payload.Delta.Type == "text_delta" && payload.Delta.Text != "" {
+				sawDelta = true
+			}
+			if payload.Type == "message_stop" {
+				return sawDelta, true
 			}
 		}
 	}

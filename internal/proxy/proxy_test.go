@@ -296,7 +296,6 @@ func TestTrustedRouterOnlyDirectiveMatrix(t *testing.T) {
 	t.Parallel()
 
 	endpoints := map[string]string{
-		messagesPath:  `{"model":"anthropic/claude-haiku-4.5","messages":[]}`,
 		responsesPath: `{"model":"openai/gpt-4.1-mini","input":"hello"}`,
 	}
 	for endpoint, defaultBody := range endpoints {
@@ -374,6 +373,195 @@ func TestTrustedRouterOnlyDirectiveMatrix(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestMessagesLocalTranslationAndCloudPassthrough(t *testing.T) {
+	t.Run("unaliased Claude id stays raw TrustedRouter passthrough", func(t *testing.T) {
+		t.Parallel()
+		raw := `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("local should not be called for an unmapped Claude cloud id")
+		})
+		seenBody := make(chan []byte, 1)
+		tr := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v1/models" {
+				writeTestJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "not found"}})
+				return
+			}
+			if r.URL.Path != "/v1/messages" {
+				t.Fatalf("tr path = %s", r.URL.Path)
+			}
+			body, _ := io.ReadAll(r.Body)
+			seenBody <- body
+			writeTestJSON(w, http.StatusOK, map[string]any{
+				"id":            "msg_tr",
+				"type":          "message",
+				"role":          "assistant",
+				"model":         "anthropic/claude-haiku-4.5",
+				"content":       []map[string]string{{"type": "text", "text": "cloud"}},
+				"stop_reason":   "end_turn",
+				"stop_sequence": nil,
+				"usage":         map[string]int{"input_tokens": 1, "output_tokens": 1},
+			})
+		})
+		proxy := newProxyWithHandlers(t, config.Config{TRAPIKey: "tr-key", BurstOnError: true}, local, tr)
+
+		resp, body := postJSON(t, proxy, messagesPath, raw, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if resp.Header.Get("X-Bursty-Route") != "trustedrouter" || resp.Header.Get("X-Bursty-Reason") != "policy" {
+			t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+		}
+		if got := <-seenBody; !bytes.Equal(got, []byte(raw)) {
+			t.Fatalf("trustedrouter body = %s, want byte-identical %s", got, raw)
+		}
+	})
+
+	t.Run("alias translates request and response on local leg", func(t *testing.T) {
+		t.Parallel()
+		seenBody := make(chan []byte, 1)
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/chat/completions" {
+				t.Fatalf("local path = %s", r.URL.Path)
+			}
+			body, _ := io.ReadAll(r.Body)
+			seenBody <- body
+			writeTestJSON(w, http.StatusOK, map[string]any{
+				"model": "llama3",
+				"choices": []map[string]any{{
+					"message":       map[string]any{"content": "pong"},
+					"finish_reason": "stop",
+				}},
+				"usage": map[string]int{"prompt_tokens": 7, "completion_tokens": 2},
+			})
+		})
+		proxy := newProxyWithHandlers(t, config.Config{
+			Aliases:      map[string]string{"anthropic/claude-haiku-4.5": "llama3"},
+			BurstOnError: true,
+		}, local, nil)
+
+		resp, body := postJSON(t, proxy, messagesPath, `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if resp.Header.Get("X-Bursty-Route") != "local" || resp.Header.Get("X-Bursty-Reason") != "policy" {
+			t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+		}
+		assertJSONEqual(t, <-seenBody, []byte(`{"model":"llama3","messages":[{"role":"user","content":"ping"}],"max_tokens":16,"stream":false}`))
+		assertAnthropicMessageText(t, body, "anthropic/claude-haiku-4.5", "pong", 7, 2)
+	})
+
+	t.Run("local prefix translates to bare local model", func(t *testing.T) {
+		t.Parallel()
+		seenBody := make(chan []byte, 1)
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			seenBody <- body
+			writeTestJSON(w, http.StatusOK, map[string]any{
+				"choices": []map[string]any{{
+					"message":       map[string]any{"content": "local"},
+					"finish_reason": "stop",
+				}},
+			})
+		})
+		proxy := newProxyWithHandlers(t, config.Config{BurstOnError: true}, local, nil)
+
+		resp, body := postJSON(t, proxy, messagesPath, `{"model":"local/llama3","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		assertJSONEqual(t, <-seenBody, []byte(`{"model":"llama3","messages":[{"role":"user","content":"ping"}],"max_tokens":16,"stream":false}`))
+		assertAnthropicMessageText(t, body, "local/llama3", "local", 0, 0)
+	})
+}
+
+func TestMessagesLocalStreamingTranslation(t *testing.T) {
+	t.Parallel()
+
+	seenBody := make(chan []byte, 1)
+	local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+	proxy := newProxyWithHandlers(t, config.Config{
+		Aliases:      map[string]string{"anthropic/claude-haiku-4.5": "llama3"},
+		BurstOnError: true,
+	}, local, nil)
+
+	resp, body := postJSON(t, proxy, messagesPath, `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"ping"}]}`, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	assertTopLevelBool(t, <-seenBody, "stream_options", "include_usage", true)
+	stream := string(body)
+	for _, want := range []string{"event: message_start", `"type":"text_delta","text":"hi"`, `"stop_reason":"end_turn"`, `"output_tokens":1`, "event: message_stop"} {
+		if !strings.Contains(stream, want) {
+			t.Fatalf("stream missing %q:\n%s", want, stream)
+		}
+	}
+}
+
+func TestMessagesBurstOnFullSendsRawAnthropicBody(t *testing.T) {
+	enteredLocal := make(chan struct{})
+	releaseLocal := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseLocal) })
+	}
+	defer release()
+
+	local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enterOnce.Do(func() { close(enteredLocal) })
+		<-releaseLocal
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"choices": []map[string]any{{
+				"message":       map[string]any{"content": "local"},
+				"finish_reason": "stop",
+			}},
+		})
+	})
+	seenTR := make(chan []byte, 1)
+	tr := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenTR <- body
+		writeTestJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+	})
+	proxy := newProxyWithHandlers(t, config.Config{
+		TRAPIKey:            "tr-key",
+		LocalMaxConcurrency: 1,
+		BurstOnError:        true,
+		Aliases:             map[string]string{"anthropic/claude-haiku-4.5": "llama3"},
+	}, local, tr)
+
+	raw := `{"model":"anthropic/claude-haiku-4.5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		_, _ = postJSON(t, proxy, messagesPath, raw, "")
+	}()
+	<-enteredLocal
+
+	resp, body := postJSON(t, proxy, messagesPath, raw, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("burst status = %d body=%s", resp.StatusCode, body)
+	}
+	if resp.Header.Get("X-Bursty-Route") != "trustedrouter" || resp.Header.Get("X-Bursty-Reason") != "burst-full" {
+		t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+	}
+	if got := <-seenTR; !bytes.Equal(got, []byte(raw)) {
+		t.Fatalf("trustedrouter burst body = %s, want %s", got, raw)
+	}
+	release()
+	<-firstDone
 }
 
 func TestFailClosedMissingPinnedUpstreams(t *testing.T) {
@@ -1398,7 +1586,7 @@ func TestTrustedRouterOnlyFailClosed(t *testing.T) {
 	local, localCalls := fakeLocal(t)
 	proxy := newProxyWithHandlers(t, config.Config{BurstOnError: true}, local, nil)
 
-	for _, endpoint := range []string{messagesPath, responsesPath} {
+	for _, endpoint := range []string{responsesPath} {
 		resp, body := postJSON(t, proxy, endpoint, `{"model":"x","messages":[]}`, "")
 		if resp.StatusCode != http.StatusNotImplemented {
 			t.Fatalf("%s status = %d body=%s", endpoint, resp.StatusCode, body)
@@ -2622,6 +2810,54 @@ func assertBurstyBlock(t *testing.T, body []byte, route, reason string) {
 	}
 	if payload.Bursty.Route != route || payload.Bursty.Reason != reason {
 		t.Fatalf("bursty block = %#v, want %s/%s body=%s", payload.Bursty, route, reason, body)
+	}
+}
+
+func assertAnthropicMessageText(t *testing.T, body []byte, model, text string, inputTokens, outputTokens int64) {
+	t.Helper()
+	var payload struct {
+		Type    string `json:"type"`
+		Role    string `json:"role"`
+		Model   string `json:"model"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("Anthropic message JSON: %v\n%s", err, body)
+	}
+	if payload.Type != "message" || payload.Role != "assistant" || payload.Model != model {
+		t.Fatalf("message envelope = %#v, want assistant message model %q; body=%s", payload, model, body)
+	}
+	if len(payload.Content) != 1 || payload.Content[0].Type != "text" || payload.Content[0].Text != text {
+		t.Fatalf("content = %#v, want text %q; body=%s", payload.Content, text, body)
+	}
+	if payload.Usage.InputTokens != inputTokens || payload.Usage.OutputTokens != outputTokens {
+		t.Fatalf("usage = %#v, want input=%d output=%d; body=%s", payload.Usage, inputTokens, outputTokens, body)
+	}
+}
+
+func assertTopLevelBool(t *testing.T, body []byte, objectKey, boolKey string, want bool) {
+	t.Helper()
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("JSON body: %v\n%s", err, body)
+	}
+	rawObject, ok := payload[objectKey]
+	if !ok {
+		t.Fatalf("missing top-level object %q in %s", objectKey, body)
+	}
+	var object map[string]bool
+	if err := json.Unmarshal(rawObject, &object); err != nil {
+		t.Fatalf("%s object JSON: %v\n%s", objectKey, err, body)
+	}
+	if got := object[boolKey]; got != want {
+		t.Fatalf("%s.%s = %v, want %v in %s", objectKey, boolKey, got, want, body)
 	}
 }
 
