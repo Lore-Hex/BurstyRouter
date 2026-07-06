@@ -57,8 +57,11 @@ export TRUSTEDROUTER_API_KEY="tr_..."
 burstyrouter -local-url http://127.0.0.1:11434 \
   -tr-api-key "$TRUSTEDROUTER_API_KEY" \
   -alias gpt-4o=llama3.2 \
-  -alias anthropic/claude-haiku-4.5=qwen2.5-coder:32b
+  -alias anthropic/claude-haiku-4.5=qwen2.5-coder:32b \
+  -savings-reference gpt-4o
 ```
+
+Explain briefly when aliases are shown: the savings number is an honest counterfactual from TrustedRouter catalog prices. With aliases, the alias key is the preferred price reference; `-savings-reference` is the fallback for local-native names. Without a catalog price anchor, BurstyRouter reports tokens only and no saved dollars.
 
 To burst unmapped local-native model ids, add a fallback model:
 
@@ -118,7 +121,7 @@ curl -fsS -H "Authorization: Bearer $BURSTY_TOKEN" "$BURSTY_HOST/v1/models"
 
 ## Other Burst Targets
 
-TrustedRouter is the default burst target, but `-tr-base-url` can point at any bearer-keyed OpenAI-compatible `/v1` base URL. Savings/pricing features are TrustedRouter-specific.
+TrustedRouter is the default burst target, but `-tr-base-url` can point at any bearer-keyed OpenAI-compatible `/v1` base URL. Savings/pricing features use the TrustedRouter catalog.
 
 ```bash
 export TRUSTEDROUTER_API_KEY="<upstream bearer token>"
@@ -128,6 +131,21 @@ burstyrouter -local-url http://127.0.0.1:11434 \
 ```
 
 If that upstream lacks `/v1/messages` or `/v1/responses`, BurstyRouter returns a clean `501 endpoint_not_supported` envelope.
+
+## Cloud Controls
+
+Mention these only when the user asks about cost, safety, disabling cloud, or strict local-first operation.
+
+```bash
+# No automatic bursts; only explicit non-local provider requests can use cloud.
+burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY" -cloud explicit
+
+# Disable cloud entirely.
+burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY" -cloud off
+
+# Cap priced cloud spend per UTC day. Unpriced cloud usage counts $0 toward the cap.
+burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY" -max-cloud-spend 1.00
+```
 
 ## Harness Wiring
 
@@ -237,7 +255,9 @@ Force TrustedRouter with a non-local provider:
 Alias cloud id to local model:
 
 ```bash
-burstyrouter -local-url http://127.0.0.1:11434 -alias gpt-4o=llama3.2
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -alias gpt-4o=llama3.2 \
+  -savings-reference gpt-4o
 ```
 
 Bursting:

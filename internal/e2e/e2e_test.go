@@ -638,6 +638,310 @@ func TestBinaryStreamingFlushesIncrementally(t *testing.T) {
 	}
 }
 
+func TestBinaryStreamingSavingsAndLocalBodySplice(t *testing.T) {
+	localLog := &requestLog{}
+	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localLog.add(r)
+		if r.URL.Path != chatPath {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unexpected local path"})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"model\":\"llama3\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer local.Close()
+
+	tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "not found"}})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "trustedrouter inference should not be called"})
+	}))
+	defer tr.Close()
+
+	catalog := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unexpected catalog path"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"data": []map[string]any{
+				{"id": "openai/gpt-4o", "pricing": map[string]any{"prompt": "0.000001", "completion": "0.000002"}},
+			},
+		})
+	}))
+	defer catalog.Close()
+
+	proc := startBursty(t, burstyConfig{
+		localURL:     local.URL,
+		trAPIKey:     "e2e-tr-key",
+		trBaseURL:    tr.URL + "/v1",
+		trCatalogURL: catalog.URL + "/v1",
+		aliases:      []string{"openai/gpt-4o=llama3"},
+	})
+
+	resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Bursty-Saved-USD"); got == "" {
+		t.Fatal("missing X-Bursty-Saved-USD")
+	}
+	assertTopLevelBool(t, localLog.last(t).Body, "stream_options", "include_usage", true)
+
+	_, statsBody := get(t, proc, "/stats", nil)
+	if got := savedUSD(t, statsBody); got != 0.00002 {
+		t.Fatalf("saved_usd = %.8f, want 0.00002; stats=%s", got, statsBody)
+	}
+}
+
+func TestBinaryStreamOptionsNotSplicedIntoBurstBody(t *testing.T) {
+	enteredLocal := make(chan struct{})
+	releaseLocal := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseLocal) })
+	}
+	defer release()
+
+	localLog := &requestLog{}
+	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localLog.add(r)
+		enterOnce.Do(func() { close(enteredLocal) })
+		<-releaseLocal
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer local.Close()
+
+	trLog := &requestLog{}
+	tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		trLog.add(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer tr.Close()
+
+	proc := startBursty(t, burstyConfig{
+		localURL:            local.URL,
+		trAPIKey:            "e2e-tr-key",
+		trBaseURL:           tr.URL + "/v1",
+		trCatalogURL:        tr.URL + "/v1",
+		localMaxConcurrency: 1,
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, err := postChatResult(proc, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, nil, 5*time.Second)
+		firstDone <- err
+	}()
+	select {
+	case <-enteredLocal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not reach local")
+	}
+	assertTopLevelBool(t, localLog.last(t).Body, "stream_options", "include_usage", true)
+
+	resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("burst status = %d body=%s", resp.StatusCode, body)
+	}
+	assertRoute(t, resp, "trustedrouter", "burst-full")
+	if bytes.Contains(trLog.last(t).Body, []byte("stream_options")) {
+		t.Fatalf("trustedrouter body contains local stream_options: %s", trLog.last(t).Body)
+	}
+
+	release()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBinaryCloudControlsAndBudget(t *testing.T) {
+	t.Run("explicit blocks automatic burst but allows explicit cloud", func(t *testing.T) {
+		enteredLocal := make(chan struct{})
+		releaseLocal := make(chan struct{})
+		var enterOnce sync.Once
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			enterOnce.Do(func() { close(enteredLocal) })
+			<-releaseLocal
+			writeJSON(w, http.StatusOK, map[string]any{"id": "local"})
+		}))
+		defer local.Close()
+
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			writeJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+		}))
+		defer tr.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL:            local.URL,
+			trAPIKey:            "e2e-tr-key",
+			trBaseURL:           tr.URL + "/v1",
+			trCatalogURL:        tr.URL + "/v1",
+			localMaxConcurrency: 1,
+			cloud:               "explicit",
+		})
+
+		firstDone := make(chan error, 1)
+		go func() {
+			_, _, err := postChatResult(proc, `{"model":"openai/gpt-4o","messages":[]}`, nil, 5*time.Second)
+			firstDone <- err
+		}()
+		select {
+		case <-enteredLocal:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first request did not reach local")
+		}
+		resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","messages":[]}`, nil)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("blocked burst status = %d body=%s", resp.StatusCode, body)
+		}
+		if trLog.count() != 0 {
+			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		}
+		close(releaseLocal)
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+
+		resp, body = postChat(t, proc, `{"model":"openai/gpt-4o","provider":{"order":["openai"]},"messages":[]}`, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("explicit status = %d body=%s", resp.StatusCode, body)
+		}
+		if trLog.count() != 1 {
+			t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+		}
+	})
+
+	t.Run("off blocks explicit cloud", func(t *testing.T) {
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, map[string]any{"id": "local"})
+		}))
+		defer local.Close()
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			writeJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+		}))
+		defer tr.Close()
+		proc := startBursty(t, burstyConfig{
+			localURL:     local.URL,
+			trAPIKey:     "e2e-tr-key",
+			trBaseURL:    tr.URL + "/v1",
+			trCatalogURL: tr.URL + "/v1",
+			cloud:        "off",
+		})
+		resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","provider":{"order":["openai"]},"messages":[]}`, nil)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if !bytes.Contains(body, []byte("cloud disabled by -cloud=off")) {
+			t.Fatalf("body = %s", body)
+		}
+		if trLog.count() != 0 {
+			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		}
+	})
+
+	t.Run("budget blocks second cloud send", func(t *testing.T) {
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/models") {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "not found"}})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id":    "tr",
+				"model": "openai/gpt-4o",
+				"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 0},
+			})
+		}))
+		defer tr.Close()
+		catalog := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"data": []map[string]any{
+					{"id": "openai/gpt-4o", "pricing": map[string]any{"prompt": "0.000001", "completion": "0.000001"}},
+				},
+			})
+		}))
+		defer catalog.Close()
+		proc := startBursty(t, burstyConfig{
+			trAPIKey:      "e2e-tr-key",
+			trBaseURL:     tr.URL + "/v1",
+			trCatalogURL:  catalog.URL + "/v1",
+			maxCloudSpend: "0.000001",
+		})
+		resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","provider":{"order":["openai"]},"messages":[]}`, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("first status = %d body=%s", resp.StatusCode, body)
+		}
+		resp, body = postChat(t, proc, `{"model":"openai/gpt-4o","provider":{"order":["openai"]},"messages":[]}`, nil)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("second status = %d body=%s", resp.StatusCode, body)
+		}
+		if resp.Header.Get("Retry-After") == "" {
+			t.Fatal("missing Retry-After")
+		}
+		if !bytes.Contains(body, []byte("cloud_budget_exhausted")) {
+			t.Fatalf("body = %s", body)
+		}
+	})
+}
+
+func TestBinaryStatePersistsAcrossRestart(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "bursty", "state.json")
+	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":    "local",
+			"model": "llama3",
+			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
+		})
+	}))
+	defer local.Close()
+	tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "not found"}})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "trustedrouter inference should not be called"})
+	}))
+	defer tr.Close()
+	catalog := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"data": []map[string]any{
+				{"id": "openai/gpt-4o", "pricing": map[string]any{"prompt": "0.000001", "completion": "0.000002"}},
+			},
+		})
+	}))
+	defer catalog.Close()
+	cfg := burstyConfig{
+		localURL:     local.URL,
+		trAPIKey:     "e2e-tr-key",
+		trBaseURL:    tr.URL + "/v1",
+		trCatalogURL: catalog.URL + "/v1",
+		aliases:      []string{"openai/gpt-4o=llama3"},
+		stateFile:    stateFile,
+	}
+
+	proc := startBursty(t, cfg)
+	resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	proc.stop(t)
+
+	proc = startBursty(t, cfg)
+	_, statsBody := get(t, proc, "/stats", nil)
+	if got := savedUSD(t, statsBody); got != 0.00002 {
+		t.Fatalf("saved_usd after restart = %.8f, want 0.00002; stats=%s", got, statsBody)
+	}
+}
+
 func TestBinarySanitizesInboundHeaders(t *testing.T) {
 	localLog := &requestLog{}
 	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -864,14 +1168,19 @@ type burstyConfig struct {
 	token               string
 	aliases             []string
 	burstFallbackModel  string
+	savingsReference    string
+	stateFile           string
+	cloud               string
+	maxCloudSpend       string
 }
 
 type burstyProcess struct {
-	baseURL string
-	client  *http.Client
-	cmd     *exec.Cmd
-	stderr  *bytes.Buffer
-	exited  chan error
+	baseURL  string
+	client   *http.Client
+	cmd      *exec.Cmd
+	stderr   *bytes.Buffer
+	exited   chan error
+	stopOnce sync.Once
 }
 
 func startBursty(t *testing.T, cfg burstyConfig) *burstyProcess {
@@ -893,6 +1202,14 @@ func startBursty(t *testing.T, cfg burstyConfig) *burstyProcess {
 	if trCatalogURL == "" {
 		trCatalogURL = "http://127.0.0.1:1/v1"
 	}
+	cloud := cfg.cloud
+	if cloud == "" {
+		cloud = "auto"
+	}
+	maxCloudSpend := cfg.maxCloudSpend
+	if maxCloudSpend == "" {
+		maxCloudSpend = "0"
+	}
 
 	args := []string{
 		"-listen", addr,
@@ -905,6 +1222,10 @@ func startBursty(t *testing.T, cfg burstyConfig) *burstyProcess {
 		"-burst-on-error=" + strconv.FormatBool(burstOnError),
 		"-token", cfg.token,
 		"-burst-fallback-model", cfg.burstFallbackModel,
+		"-savings-reference", cfg.savingsReference,
+		"-state-file", cfg.stateFile,
+		"-cloud", cloud,
+		"-max-cloud-spend", maxCloudSpend,
 	}
 	for _, alias := range cfg.aliases {
 		args = append(args, "-alias", alias)
@@ -929,13 +1250,7 @@ func startBursty(t *testing.T, cfg burstyConfig) *burstyProcess {
 		exited:  exited,
 	}
 	t.Cleanup(func() {
-		_ = proc.cmd.Process.Signal(os.Interrupt)
-		select {
-		case <-proc.exited:
-		case <-time.After(2 * time.Second):
-			_ = proc.cmd.Process.Kill()
-			<-proc.exited
-		}
+		proc.stop(t)
 		if t.Failed() {
 			t.Logf("burstyrouter stderr:\n%s", proc.stderr.String())
 		}
@@ -962,6 +1277,23 @@ func startBursty(t *testing.T, cfg burstyConfig) *burstyProcess {
 	}
 	t.Fatalf("burstyrouter did not become ready\nstderr:\n%s", stderr.String())
 	return nil
+}
+
+func (p *burstyProcess) stop(t *testing.T) {
+	t.Helper()
+	p.stopOnce.Do(func() {
+		if p.cmd.Process != nil {
+			_ = p.cmd.Process.Signal(os.Interrupt)
+		}
+		select {
+		case <-p.exited:
+		case <-time.After(2 * time.Second):
+			if p.cmd.Process != nil {
+				_ = p.cmd.Process.Kill()
+			}
+			<-p.exited
+		}
+	})
 }
 
 func freeAddr(t *testing.T) string {
@@ -1125,7 +1457,7 @@ func assertStatsShape(t *testing.T, body []byte) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("stats JSON: %v\n%s", err, body)
 	}
-	for _, key := range []string{"in_flight_local", "bursts_full", "bursts_error", "bursts_skipped_unmapped", "forced_local", "forced_tr", "requests_total", "catalog_errors", "routes", "endpoint_routes"} {
+	for _, key := range []string{"in_flight_local", "bursts_full", "bursts_error", "bursts_skipped_unmapped", "forced_local", "forced_tr", "requests_total", "catalog_errors", "cloud_blocked_budget", "cloud_blocked_mode", "cloud_mode", "savings", "routes", "endpoint_routes"} {
 		if _, ok := payload[key]; !ok {
 			t.Fatalf("stats missing key %q: %#v", key, payload)
 		}
@@ -1204,6 +1536,25 @@ func assertTopLevelString(t *testing.T, body []byte, key, want string) {
 	}
 }
 
+func assertTopLevelBool(t *testing.T, body []byte, objectKey, boolKey string, want bool) {
+	t.Helper()
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("JSON body: %v\n%s", err, body)
+	}
+	rawObject, ok := payload[objectKey]
+	if !ok {
+		t.Fatalf("missing top-level object %q in %s", objectKey, body)
+	}
+	var object map[string]bool
+	if err := json.Unmarshal(rawObject, &object); err != nil {
+		t.Fatalf("%s object JSON: %v\n%s", objectKey, err, body)
+	}
+	if got := object[boolKey]; got != want {
+		t.Fatalf("%s.%s = %v, want %v in %s", objectKey, boolKey, got, want, body)
+	}
+}
+
 func assertNoTopLevelKey(t *testing.T, body []byte, key string) {
 	t.Helper()
 	var payload map[string]json.RawMessage
@@ -1213,6 +1564,19 @@ func assertNoTopLevelKey(t *testing.T, body []byte, key string) {
 	if _, ok := payload[key]; ok {
 		t.Fatalf("top-level %q was forwarded in %s", key, body)
 	}
+}
+
+func savedUSD(t *testing.T, body []byte) float64 {
+	t.Helper()
+	var payload struct {
+		Savings struct {
+			SavedUSD float64 `json:"saved_usd"`
+		} `json:"savings"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("stats JSON: %v\n%s", err, body)
+	}
+	return payload.Savings.SavedUSD
 }
 
 func assertSanitizedLocalHeaders(t *testing.T, header http.Header) {

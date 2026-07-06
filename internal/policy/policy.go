@@ -51,6 +51,7 @@ type Decision struct {
 	LocalBody            []byte
 	TRBody               []byte
 	View                 RequestView
+	AliasKey             string
 	BurstAllowed         bool
 	BurstSkippedUnmapped bool
 }
@@ -79,6 +80,9 @@ func Decide(raw []byte, hasLocal, hasTrustedRouter bool, options ...Options) (De
 	aliasTarget, aliased := aliasFor(view, opts.Aliases)
 
 	decision := Decision{TRBody: raw, View: view}
+	if aliased {
+		decision.AliasKey = view.Model
+	}
 	localBody := func() error {
 		if decision.LocalBody != nil {
 			return nil
@@ -129,6 +133,9 @@ func Decide(raw []byte, hasLocal, hasTrustedRouter bool, options ...Options) (De
 		}
 	}
 
+	if mentionsNonLocal(view.Provider) {
+		return trustedRouter(ReasonForced)
+	}
 	if !hasLocal {
 		return trustedRouter(ReasonPolicy)
 	}
@@ -141,9 +148,6 @@ func Decide(raw []byte, hasLocal, hasTrustedRouter bool, options ...Options) (De
 
 	if isLocalOnly(view.Provider) {
 		return local(ReasonForced)
-	}
-	if mentionsNonLocal(view.Provider) {
-		return trustedRouter(ReasonForced)
 	}
 	if strings.HasPrefix(view.Model, "local/") {
 		return local(ReasonForced)
@@ -204,7 +208,18 @@ func localForwardBody(raw []byte, view RequestView, aliasTarget string) ([]byte,
 			return nil, err
 		}
 	}
+	if view.Stream {
+		body, err = injectStreamUsage(body)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return body, nil
+}
+
+func injectStreamUsage(raw []byte) ([]byte, error) {
+	payload := []byte(`{"include_usage":true}`)
+	return InjectTopLevelObject(raw, "stream_options", payload)
 }
 
 func firstOptions(options []Options) Options {

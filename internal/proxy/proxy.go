@@ -9,8 +9,10 @@ import (
 	"expvar"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,12 +71,20 @@ type Server struct {
 	stats      *stats
 	models     modelsCache
 	catalog    *http.Client
+	savings    *savingsMeter
+	cloud      *cloudControl
+	logStop    chan struct{}
+	logDone    chan struct{}
+	closeOnce  sync.Once
 }
 
 // New builds a configured proxy server.
 func New(cfg config.Config) (*Server, error) {
 	if cfg.LocalMaxConcurrency < 1 {
 		return nil, errors.New("local max concurrency must be at least 1")
+	}
+	if cfg.Cloud == "" {
+		cfg.Cloud = config.CloudAuto
 	}
 
 	var local *upstream.Local
@@ -98,18 +108,28 @@ func New(cfg config.Config) (*Server, error) {
 	if local != nil {
 		slots = make(chan struct{}, cfg.LocalMaxConcurrency)
 	}
-	return &Server{
+	server := &Server{
 		cfg:        cfg,
 		local:      local,
 		tr:         tr,
 		localSlots: slots,
 		stats:      newStats(),
 		catalog:    &http.Client{Timeout: catalogTimeout},
-	}, nil
+		savings:    newSavingsMeter(cfg.StateFile),
+		cloud:      newCloudControl(cfg.Cloud),
+		logStop:    make(chan struct{}),
+		logDone:    make(chan struct{}),
+	}
+	server.logSavingsSummary()
+	go server.savingsLogLoop()
+	return server, nil
 }
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.savings != nil {
+		w = &savingsHeaderWriter{ResponseWriter: w, savings: s.savings}
+	}
 	if r.URL.Path == "/healthz" {
 		s.handleHealth(w, r)
 		return
@@ -162,7 +182,14 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "invalid_request_error")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.stats.snapshot())
+	payload := s.stats.snapshot()
+	if s.savings != nil {
+		payload["savings"] = s.savings.Snapshot(s.stats.localShare())
+	}
+	if s.cloud != nil {
+		payload["cloud_mode"] = string(s.cloud.EffectiveMode())
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +250,7 @@ func (s *Server) handleLocalCapable(w http.ResponseWriter, r *http.Request, endp
 	case policy.RouteLocal:
 		s.serveLocalCapable(w, r, decision, endpoint)
 	case policy.RouteTrustedRouter:
-		s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, decision.Reason, endpoint.family)
+		s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, decision.Reason, endpoint.family, decision)
 	default:
 		writeRoutedError(w, s.defaultRoute(), policy.ReasonPolicy, http.StatusInternalServerError, "internal_error", "unknown route", "api_error")
 	}
@@ -233,7 +260,11 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 	forced := decision.Reason == policy.ReasonForced
 	if s.local == nil {
 		if s.tr != nil {
-			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonPolicy, endpoint.family)
+			if decision.Reason != policy.ReasonForced && s.cloud != nil && s.cloud.EffectiveMode() != config.CloudAuto {
+				writeRoutedError(w, policy.RouteLocal, policy.ReasonPolicy, http.StatusBadGateway, "no_local_upstream", "local upstream is not configured", "api_error")
+				return
+			}
+			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, decision.Reason, endpoint.family, decision)
 			return
 		}
 		writeRoutedError(w, policy.RouteLocal, policy.ReasonPolicy, http.StatusBadGateway, "no_local_upstream", "local upstream is not configured", "api_error")
@@ -246,9 +277,15 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 	case localSlotFull:
 		if !forced && s.tr != nil {
 			if decision.BurstAllowed {
-				s.stats.burstsFull.Add(1)
-				s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstFull, endpoint.family)
-				return
+				switch s.allowAutomaticCloud(w, policy.ReasonBurstFull) {
+				case cloudAllowed:
+					s.stats.burstsFull.Add(1)
+					s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstFull, endpoint.family, decision)
+					return
+				case cloudBlockedBudget:
+					return
+				case cloudBlockedMode:
+				}
 			}
 			s.countSkippedUnmapped(decision)
 		}
@@ -267,10 +304,16 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 	if err != nil {
 		if !forced && s.cfg.BurstOnError && s.tr != nil {
 			if decision.BurstAllowed {
-				s.stats.burstsError.Add(1)
-				releaseLocalSlot()
-				s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
-				return
+				switch s.allowAutomaticCloud(w, policy.ReasonBurstError) {
+				case cloudAllowed:
+					s.stats.burstsError.Add(1)
+					releaseLocalSlot()
+					s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family, decision)
+					return
+				case cloudBlockedBudget:
+					return
+				case cloudBlockedMode:
+				}
 			}
 			s.countSkippedUnmapped(decision)
 		}
@@ -286,11 +329,18 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 	}
 	if shouldBurst && !forced && s.cfg.BurstOnError && s.tr != nil {
 		if decision.BurstAllowed {
-			s.stats.burstsError.Add(1)
-			closeBurstResponseBody(resp)
-			releaseLocalSlot()
-			s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family)
-			return
+			switch s.allowAutomaticCloud(w, policy.ReasonBurstError) {
+			case cloudAllowed:
+				s.stats.burstsError.Add(1)
+				closeBurstResponseBody(resp)
+				releaseLocalSlot()
+				s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstError, endpoint.family, decision)
+				return
+			case cloudBlockedBudget:
+				closeBurstResponseBody(resp)
+				return
+			case cloudBlockedMode:
+			}
 		}
 		s.countSkippedUnmapped(decision)
 	}
@@ -300,10 +350,36 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 		return
 	}
 
-	s.serveUpstreamResponse(w, resp, policy.RouteLocal, decision.Reason, decision.View.Stream, endpoint.family)
+	s.serveUpstreamResponse(w, r, resp, policy.RouteLocal, decision.Reason, decision.View.Stream, endpoint.family, decision)
 }
 
-func (s *Server) serveTrustedRouterRaw(w http.ResponseWriter, r *http.Request, path string, body []byte, requestStream bool, reason policy.Reason, endpoint endpointFamily) {
+type cloudAllowance int
+
+const (
+	cloudAllowed cloudAllowance = iota
+	cloudBlockedMode
+	cloudBlockedBudget
+)
+
+func (s *Server) allowAutomaticCloud(w http.ResponseWriter, reason policy.Reason) cloudAllowance {
+	if s.cloud != nil && s.cloud.EffectiveMode() != config.CloudAuto {
+		s.stats.cloudBlockedMode.Add(1)
+		return cloudBlockedMode
+	}
+	if s.writeCloudBudgetBlockIfNeeded(w, reason) {
+		return cloudBlockedBudget
+	}
+	return cloudAllowed
+}
+
+func (s *Server) serveTrustedRouterRaw(w http.ResponseWriter, r *http.Request, path string, body []byte, requestStream bool, reason policy.Reason, endpoint endpointFamily, decision policy.Decision) {
+	explicit := reason == policy.ReasonForced || isTrustedRouterOnlyEndpoint(endpoint)
+	if s.writeCloudModeBlockIfNeeded(w, reason, explicit) {
+		return
+	}
+	if s.writeCloudBudgetBlockIfNeeded(w, reason) {
+		return
+	}
 	if s.tr == nil {
 		w.Header().Set("Retry-After", "1")
 		writeRoutedError(w, policy.RouteLocal, reason, http.StatusTooManyRequests, "local_overloaded", "TrustedRouter is not configured", "rate_limit_error")
@@ -325,7 +401,48 @@ func (s *Server) serveTrustedRouterRaw(w http.ResponseWriter, r *http.Request, p
 		writePassthroughUnsupported(w, r.URL.Path, reason)
 		return
 	}
-	s.serveUpstreamResponse(w, resp, policy.RouteTrustedRouter, reason, requestStream, endpoint)
+	s.serveUpstreamResponse(w, r, resp, policy.RouteTrustedRouter, reason, requestStream, endpoint, decision)
+}
+
+func (s *Server) writeCloudModeBlockIfNeeded(w http.ResponseWriter, reason policy.Reason, explicit bool) bool {
+	if s.cloud == nil {
+		return false
+	}
+	mode := s.cloud.EffectiveMode()
+	switch mode {
+	case config.CloudAuto:
+		return false
+	case config.CloudExplicit:
+		if explicit {
+			return false
+		}
+		s.stats.cloudBlockedMode.Add(1)
+		writeRoutedError(w, policy.RouteTrustedRouter, reason, http.StatusTooManyRequests, "cloud_disabled", "cloud disabled by -cloud=explicit", "rate_limit_error")
+		return true
+	case config.CloudOff:
+		s.stats.cloudBlockedMode.Add(1)
+		writeRoutedError(w, policy.RouteTrustedRouter, reason, http.StatusServiceUnavailable, "cloud_disabled", "cloud disabled by -cloud=off", "api_error")
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) writeCloudBudgetBlockIfNeeded(w http.ResponseWriter, reason policy.Reason) bool {
+	if s.savings == nil || s.cfg.MaxCloudSpendMicro <= 0 {
+		return false
+	}
+	now := time.Now().UTC()
+	if !s.savings.BudgetExhausted(s.cfg.MaxCloudSpendMicro, now) {
+		return false
+	}
+	s.stats.cloudBlockedBudget.Add(1)
+	if s.cloud != nil {
+		s.cloud.LogBudgetBlockOnce(now, s.cfg.MaxCloudSpendMicro)
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(retryAfterUTCMidnight(now), 10))
+	writeRoutedError(w, policy.RouteTrustedRouter, reason, http.StatusTooManyRequests, "cloud_budget_exhausted", "daily cloud spend budget exhausted", "cloud_budget_exhausted")
+	return true
 }
 
 func (s *Server) handleTrustedRouterOnly(w http.ResponseWriter, r *http.Request, endpoint endpointFamily, path string) {
@@ -356,7 +473,7 @@ func (s *Server) handleTrustedRouterOnly(w http.ResponseWriter, r *http.Request,
 	if decision.Reason == policy.ReasonForced {
 		s.stats.forcedTR.Add(1)
 	}
-	s.serveTrustedRouterRaw(w, r, path, decision.TRBody, decision.View.Stream, decision.Reason, endpoint)
+	s.serveTrustedRouterRaw(w, r, path, decision.TRBody, decision.View.Stream, decision.Reason, endpoint, decision)
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -395,6 +512,49 @@ func (s *Server) defaultRoute() policy.Route {
 		return policy.RouteLocal
 	}
 	return policy.RouteTrustedRouter
+}
+
+// Close flushes persistent savings state and stops background proxy goroutines.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		if s.logStop != nil {
+			close(s.logStop)
+			<-s.logDone
+		}
+		s.logSavingsSummary()
+		if s.savings != nil {
+			s.savings.Close()
+		}
+	})
+}
+
+// HandleSIGHUP toggles cloud egress between the configured mode and off.
+func (s *Server) HandleSIGHUP() {
+	if s.cloud != nil {
+		s.cloud.HandleSIGHUP()
+	}
+}
+
+func (s *Server) savingsLogLoop() {
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+	defer close(s.logDone)
+	for {
+		select {
+		case <-ticker.C:
+			s.logSavingsSummary()
+		case <-s.logStop:
+			return
+		}
+	}
+}
+
+func (s *Server) logSavingsSummary() {
+	if s.savings == nil || s.stats == nil {
+		return
+	}
+	saved, cloudSpend, ref := s.savings.Totals()
+	log.Printf("bursty savings: served %.0f%% locally, saved $%s (ref: %s), cloud spend $%s", s.stats.localShare()*100, formatUSDLog(saved), ref, formatUSDLog(cloudSpend))
 }
 
 func (s *Server) acquireLocalSlot(ctx context.Context) localSlotResult {
@@ -496,7 +656,7 @@ func modelCandidates(model string) []string {
 	return []string{model}
 }
 
-func (s *Server) serveUpstreamResponse(w http.ResponseWriter, resp *http.Response, route policy.Route, reason policy.Reason, requestStream bool, endpoint endpointFamily) {
+func (s *Server) serveUpstreamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, route policy.Route, reason policy.Reason, requestStream bool, endpoint endpointFamily, decision policy.Decision) {
 	s.stats.countEndpointRoute(endpoint, route)
 	copyResponseHeaders(w.Header(), resp.Header)
 	setRouteHeaders(w, route, reason)
@@ -509,6 +669,15 @@ func (s *Server) serveUpstreamResponse(w http.ResponseWriter, resp *http.Respons
 			w.Header().Del("Content-Encoding")
 			writeRoutedError(w, route, reason, http.StatusBadGateway, "upstream_read_error", err.Error(), "api_error")
 			return
+		}
+		capture := usageCapture{}
+		record := savingsRecord{}
+		if shouldCaptureUsage(resp) {
+			capture = extractUsageAndModel(body)
+			record = s.recordResponseUsage(r.Context(), route, decision, capture, false)
+		}
+		if route == policy.RouteTrustedRouter {
+			s.logCloudCompletion(reason, decision, capture, record)
 		}
 		if len(bytes.TrimSpace(body)) > 0 {
 			injected, err := injectBurstyBlock(body, route, reason)
@@ -527,17 +696,34 @@ func (s *Server) serveUpstreamResponse(w http.ResponseWriter, resp *http.Respons
 	}
 
 	w.Header().Del("Content-Length")
-	streamBody(w, resp)
+	var scanner *streamUsageScanner
+	if shouldCaptureUsage(resp) {
+		scanner = &streamUsageScanner{}
+	}
+	streamBody(w, resp, scanner)
+	capture := usageCapture{}
+	record := savingsRecord{}
+	if scanner != nil {
+		capture = scanner.Finish()
+		record = s.recordResponseUsage(r.Context(), route, decision, capture, true)
+	}
+	if route == policy.RouteTrustedRouter {
+		s.logCloudCompletion(reason, decision, capture, record)
+	}
 }
 
-func streamBody(w http.ResponseWriter, resp *http.Response) {
+func streamBody(w http.ResponseWriter, resp *http.Response, scanner *streamUsageScanner) {
 	flusher, _ := w.(http.Flusher)
 	w.WriteHeader(resp.StatusCode)
 	if flusher != nil {
 		flusher.Flush()
 	}
 	buf := make([]byte, 32*1024)
-	_, _ = io.CopyBuffer(flushWriter{w: w, flusher: flusher}, resp.Body, buf)
+	writer := io.Writer(flushWriter{w: w, flusher: flusher})
+	if scanner != nil {
+		writer = usageScanningWriter{dst: writer, scanner: scanner}
+	}
+	_, _ = io.CopyBuffer(writer, resp.Body, buf)
 }
 
 type flushWriter struct {
@@ -553,6 +739,38 @@ func (w flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+type savingsHeaderWriter struct {
+	http.ResponseWriter
+	savings *savingsMeter
+	wrote   bool
+}
+
+func (w *savingsHeaderWriter) WriteHeader(status int) {
+	if !w.wrote {
+		w.wrote = true
+		if w.savings != nil && w.Header().Get("X-Bursty-Route") != "" {
+			w.Header().Set("X-Bursty-Saved-USD", w.savings.SavedUSDHeader())
+		}
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *savingsHeaderWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *savingsHeaderWriter) Flush() {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func injectBurstyBlock(body []byte, route policy.Route, reason policy.Reason) ([]byte, error) {
 	payload, err := json.Marshal(map[string]string{
 		"route":  string(route),
@@ -562,6 +780,41 @@ func injectBurstyBlock(body []byte, route policy.Route, reason policy.Reason) ([
 		return nil, err
 	}
 	return policy.InjectTopLevelObject(body, "bursty", payload)
+}
+
+func (s *Server) recordResponseUsage(ctx context.Context, route policy.Route, decision policy.Decision, capture usageCapture, streaming bool) savingsRecord {
+	if s.savings == nil {
+		return savingsRecord{}
+	}
+	if !capture.HasUsage {
+		if streaming {
+			s.savings.RecordUnknownUsage()
+		}
+		return savingsRecord{}
+	}
+	switch route {
+	case policy.RouteLocal:
+		return s.savings.RecordLocalUsage(capture.Usage, s.localSavingsPrice(ctx, decision))
+	case policy.RouteTrustedRouter:
+		model := responseModel(capture, decision.View.Model)
+		return s.savings.RecordCloudUsage(capture.Usage, s.cloudSavingsPrice(ctx, model))
+	default:
+		return savingsRecord{}
+	}
+}
+
+func (s *Server) logCloudCompletion(reason policy.Reason, decision policy.Decision, capture usageCapture, record savingsRecord) {
+	model := responseModel(capture, decision.View.Model)
+	if model == "" {
+		model = "unknown"
+	}
+	promptTokens := capture.Usage.PromptTokens
+	completionTokens := capture.Usage.CompletionTokens
+	if record.Priced {
+		log.Printf("bursty cloud: reason=%s model=%s prompt_toks=%d completion_toks=%d est_cost=$%s", reason, model, promptTokens, completionTokens, formatUSDBurst(record.CostMicro))
+		return
+	}
+	log.Printf("bursty cloud: reason=%s model=%s prompt_toks=%d completion_toks=%d", reason, model, promptTokens, completionTokens)
 }
 
 func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
@@ -708,6 +961,8 @@ type stats struct {
 	forcedTR              expvar.Int
 	requestsTotal         expvar.Int
 	catalogErrors         expvar.Int
+	cloudBlockedBudget    expvar.Int
+	cloudBlockedMode      expvar.Int
 	routes                routeStats
 	chatRoutes            routeStats
 	embeddingRoutes       routeStats
@@ -765,6 +1020,8 @@ func (s *stats) snapshot() map[string]any {
 		"forced_tr":               s.forcedTR.Value(),
 		"requests_total":          s.requestsTotal.Value(),
 		"catalog_errors":          s.catalogErrors.Value(),
+		"cloud_blocked_budget":    s.cloudBlockedBudget.Value(),
+		"cloud_blocked_mode":      s.cloudBlockedMode.Value(),
 		"routes":                  s.routes.snapshot(),
 		"endpoint_routes": map[string]any{
 			string(endpointChatCompletions): s.chatRoutes.snapshot(),
@@ -773,6 +1030,16 @@ func (s *stats) snapshot() map[string]any {
 			string(endpointResponses):       s.responseRoutes.snapshot(),
 		},
 	}
+}
+
+func (s *stats) localShare() float64 {
+	local := s.routes.local.Value()
+	tr := s.routes.tr.Value()
+	total := local + tr
+	if total == 0 {
+		return 0
+	}
+	return float64(local) / float64(total)
 }
 
 type modelsCache struct {
@@ -812,12 +1079,14 @@ func (s *Server) cachedTrustedRouterModels(ctx context.Context) ([]map[string]an
 }
 
 func (s *Server) fetchTrustedRouterModelMaps(ctx context.Context) ([]map[string]any, error) {
-	list, err := s.tr.Models(ctx)
-	if err == nil {
-		return trustedModelsToMaps(list)
-	}
-	if !isTrustedRouterNotFound(err) {
-		return nil, err
+	if s.tr != nil {
+		list, err := s.tr.Models(ctx)
+		if err == nil {
+			return trustedModelsToMaps(list)
+		}
+		if !isTrustedRouterNotFound(err) {
+			return nil, err
+		}
 	}
 	// The SDK default reaches TrustedRouter's attested API plane, where /v1/models
 	// can be absent; the public model catalog lives on the control plane.

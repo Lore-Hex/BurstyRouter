@@ -33,20 +33,48 @@ done
 | `-local-url` | `BURSTY_LOCAL_URL` | `""` |
 | `-tr-api-key` | `TRUSTEDROUTER_API_KEY` | `""` |
 | `-tr-base-url` | `BURSTY_TR_BASE_URL` | `https://api.quillrouter.com/v1` |
+| `-tr-catalog-url` | `BURSTY_TR_CATALOG_URL` | `https://trustedrouter.com/v1` |
 | `-local-max-concurrency` | `BURSTY_LOCAL_MAX_CONCURRENCY` | `4` |
 | `-local-queue-wait` | `BURSTY_LOCAL_QUEUE_WAIT` | `0s` |
 | `-burst-on-error` | `BURSTY_BURST_ON_ERROR` | `true` |
 | `-burst-fallback-model` | `BURSTY_BURST_FALLBACK_MODEL` | `""` |
 | `-alias from=to` | `BURSTY_ALIASES=a=b,c=d` | `""` |
+| `-savings-reference` | `BURSTY_SAVINGS_REFERENCE` | `""` |
+| `-state-file` | `BURSTY_STATE_FILE` | `$XDG_STATE_HOME/bursty/state.json` or `~/.bursty/state.json`; `""` disables |
+| `-cloud` | `BURSTY_CLOUD` | `auto` |
+| `-max-cloud-spend` | `BURSTY_MAX_CLOUD_SPEND` | `0` |
 | `-token` | `BURSTY_TOKEN` | `""` |
 
 At least one of `-local-url` or `-tr-api-key` is required. Set `BURSTY_TOKEN` whenever the proxy is reachable outside localhost. Auth accepts either `Authorization: Bearer <token>` or `x-api-key: <token>`.
 
 Aliases map cloud-facing ids to local model ids. For example, `-alias gpt-4o=qwen2.5-coder:32b` lets tools request `gpt-4o`; local receives `qwen2.5-coder:32b`, while bursts still send `gpt-4o`.
 
+## Savings
+
+BurstyRouter keeps an honest savings meter in `/stats` and `X-Bursty-Saved-USD`. Local tokens are priced only as a labeled counterfactual using TrustedRouter catalog prices. The reference is chosen in order: the alias key for aliased requests, the requested TrustedRouter-known model, `-savings-reference`, then tokens-only with no dollars. BurstyRouter never invents a price when the catalog has no price anchor.
+
+For local model names that are not cloud ids, pair the local alias with an explicit savings reference:
+
+```bash
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -alias gpt-4o=llama3.2 \
+  -savings-reference gpt-4o
+```
+
+Cloud spend is priced from the actual model id returned by the cloud response when that model exists in the TrustedRouter catalog. Unpriced cloud usage still counts tokens in stats but counts `$0` toward the spend cap.
+
+## Cloud Controls
+
+`-cloud=auto|explicit|off` controls cloud egress. `auto` preserves normal bursting. `explicit` disables automatic bursts, so local-full requests return `429` and local errors surface, while requests that explicitly name a non-local provider can still go out. `off` disables the cloud upstream entirely; explicit cloud requests fail closed with `cloud disabled by -cloud=off`.
+
+Send `SIGHUP` to toggle runtime cloud egress between the configured mode and `off`. `/stats` reports the effective mode.
+
+`-max-cloud-spend <usd>` sets a per-UTC-day cloud spend cap. Once priced cloud spend reaches the cap, all cloud sends return `429 cloud_budget_exhausted` with `Retry-After` set to seconds until UTC midnight. Unpriced cloud usage honestly counts as `$0` toward the cap.
+
 ## Bursting To Other Clouds
 
-`-tr-base-url` can point at any bearer-keyed OpenAI-compatible `/v1` base URL, including OpenRouter, Together, Groq, or your own upstream. TrustedRouter is only the default. The future savings/pricing features are TrustedRouter-specific.
+`-tr-base-url` can point at any bearer-keyed OpenAI-compatible `/v1` base URL, including OpenRouter, Together, Groq, or your own upstream. TrustedRouter is only the default. Savings/pricing features use the TrustedRouter catalog.
 
 If that upstream does not implement `/v1/messages` or `/v1/responses`, BurstyRouter maps its `404` to a clean `501 endpoint_not_supported` Bursty error envelope.
 
@@ -86,7 +114,7 @@ Routes are `local` or `trustedrouter`. Reasons are `policy`, `forced`, `burst-fu
 
 ## Stats
 
-`GET /stats` reports `in_flight_local`, `bursts_full`, `bursts_error`, `bursts_skipped_unmapped`, `forced_local`, `forced_tr`, `requests_total`, global `routes`, and `endpoint_routes` for `chat_completions`, `embeddings`, `messages`, and `responses`.
+`GET /stats` reports `in_flight_local`, `bursts_full`, `bursts_error`, `bursts_skipped_unmapped`, `forced_local`, `forced_tr`, `requests_total`, `cloud_mode`, `cloud_blocked_budget`, `cloud_blocked_mode`, `savings`, global `routes`, and `endpoint_routes` for `chat_completions`, `embeddings`, `messages`, and `responses`.
 
 ## Setup
 

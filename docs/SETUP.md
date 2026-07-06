@@ -36,8 +36,11 @@ export TRUSTEDROUTER_API_KEY="tr_..."
 burstyrouter -local-url http://127.0.0.1:11434 \
   -tr-api-key "$TRUSTEDROUTER_API_KEY" \
   -alias gpt-4o=llama3.2 \
-  -alias anthropic/claude-haiku-4.5=qwen2.5-coder:32b
+  -alias anthropic/claude-haiku-4.5=qwen2.5-coder:32b \
+  -savings-reference gpt-4o
 ```
+
+The savings meter is an honest counterfactual: local tokens are priced only from TrustedRouter catalog prices, using the alias key first, then the requested TrustedRouter-known model, then `-savings-reference`. Without one of those price anchors, BurstyRouter counts tokens only and reports no saved dollars.
 
 TrustedRouter-only:
 
@@ -111,7 +114,34 @@ burstyrouter -local-url http://127.0.0.1:11434 \
   -tr-base-url "https://openrouter.ai/api/v1"
 ```
 
-Savings/pricing features are TrustedRouter-specific. If the configured burst upstream lacks `/v1/messages` or `/v1/responses`, BurstyRouter returns a clean `501 endpoint_not_supported` envelope for those passthrough endpoints.
+Savings/pricing features use the TrustedRouter catalog. If the configured burst upstream lacks `/v1/messages` or `/v1/responses`, BurstyRouter returns a clean `501 endpoint_not_supported` envelope for those passthrough endpoints.
+
+## 3b. Savings And Cloud Controls
+
+Savings state is written to `$XDG_STATE_HOME/bursty/state.json` or `~/.bursty/state.json`; set `-state-file ""` to disable persistence.
+
+Cloud egress modes:
+
+```bash
+# Normal local-first bursting.
+burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY" -cloud auto
+
+# No automatic bursts; only explicit non-local provider requests can use cloud.
+burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY" -cloud explicit
+
+# Disable cloud entirely.
+burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY" -cloud off
+```
+
+Set a per-UTC-day cap:
+
+```bash
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -tr-api-key "$TRUSTEDROUTER_API_KEY" \
+  -max-cloud-spend 1.00
+```
+
+Once priced cloud spend reaches the cap, cloud sends return `429 cloud_budget_exhausted` with `Retry-After` set to seconds until UTC midnight. Unpriced cloud usage counts `$0` toward this cap, and remains visible as unpriced token usage in `/stats`.
 
 ## 4. Expose With Ngrok
 
@@ -242,7 +272,9 @@ Force TrustedRouter:
 Alias cloud id to local model:
 
 ```bash
-burstyrouter -local-url http://127.0.0.1:11434 -alias gpt-4o=llama3.2
+burstyrouter -local-url http://127.0.0.1:11434 \
+  -alias gpt-4o=llama3.2 \
+  -savings-reference gpt-4o
 ```
 
 Allow unmapped local-native ids to burst with a fallback model:

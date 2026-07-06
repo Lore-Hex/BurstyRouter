@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Lore-Hex/BurstyRouter/internal/config"
+	"github.com/Lore-Hex/BurstyRouter/internal/policy"
 	"github.com/Lore-Hex/BurstyRouter/internal/upstream"
 )
 
@@ -1938,6 +1941,345 @@ func TestStatsEndpointRouteCounters(t *testing.T) {
 	}
 }
 
+func TestSavingsPricingPrecedence(t *testing.T) {
+	t.Parallel()
+
+	proxy := &Server{
+		cfg: config.Config{
+			SavingsReference: "openai/reference",
+			Cloud:            config.CloudAuto,
+		},
+		stats:   newStats(),
+		savings: newSavingsMeter(""),
+		cloud:   newCloudControl(config.CloudAuto),
+	}
+	setCatalogModels(proxy,
+		pricedModel("openai/alias", "0.000010", "0.000020"),
+		pricedModel("openai/request", "0.000030", "0.000040"),
+		pricedModel("openai/reference", "0.000050", "0.000060"),
+	)
+
+	tests := []struct {
+		name     string
+		decision policy.Decision
+		wantRef  string
+		wantCost int64
+	}{
+		{
+			name: "alias key wins",
+			decision: policy.Decision{
+				AliasKey: "openai/alias",
+				View:     policy.RequestView{Model: "openai/request"},
+			},
+			wantRef:  "openai/alias",
+			wantCost: 10*10 + 5*20,
+		},
+		{
+			name: "requested known model wins over reference",
+			decision: policy.Decision{
+				View: policy.RequestView{Model: "openai/request"},
+			},
+			wantRef:  "openai/request",
+			wantCost: 10*30 + 5*40,
+		},
+		{
+			name: "reference used when requested model lacks price",
+			decision: policy.Decision{
+				View: policy.RequestView{Model: "local-native"},
+			},
+			wantRef:  "openai/reference",
+			wantCost: 10*50 + 5*60,
+		},
+		{
+			name: "tokens only without price anchor",
+			decision: policy.Decision{
+				View: policy.RequestView{Model: "local-native"},
+			},
+			wantRef:  "",
+			wantCost: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.wantRef == "" {
+				proxy.cfg.SavingsReference = ""
+			} else {
+				proxy.cfg.SavingsReference = "openai/reference"
+			}
+			quote := proxy.localSavingsPrice(context.Background(), tt.decision)
+			if quote.Reference != tt.wantRef {
+				t.Fatalf("reference = %q, want %q", quote.Reference, tt.wantRef)
+			}
+			if got := quote.costMicro(tokenUsage{PromptTokens: 10, CompletionTokens: 5}); got != tt.wantCost {
+				t.Fatalf("cost = %d, want %d", got, tt.wantCost)
+			}
+		})
+	}
+}
+
+func TestSavingsStateRoundTripCorruptRecoveryAndAtomicWrite(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	file := filepath.Join(t.TempDir(), "state", "state.json")
+	meter := newSavingsMeterForTest(file, func() time.Time { return now })
+	meter.RecordLocalUsage(tokenUsage{PromptTokens: 10, CompletionTokens: 5}, priceQuote{
+		Reference:               "openai/gpt-4o",
+		PromptMicroPerToken:     2,
+		CompletionMicroPerToken: 4,
+		Priced:                  true,
+	})
+	meter.RecordCloudUsage(tokenUsage{PromptTokens: 3, CompletionTokens: 2}, priceQuote{
+		Reference:               "openai/gpt-4o",
+		PromptMicroPerToken:     10,
+		CompletionMicroPerToken: 20,
+		Priced:                  true,
+	})
+	if err := meter.FlushIfDirty(); err != nil {
+		t.Fatalf("FlushIfDirty() error = %v", err)
+	}
+	if matches, err := filepath.Glob(filepath.Join(filepath.Dir(file), ".state-*.tmp")); err != nil || len(matches) != 0 {
+		t.Fatalf("temp files = %#v err=%v", matches, err)
+	}
+
+	loaded := newSavingsMeterForTest(file, func() time.Time { return now })
+	if loaded.state.SavedUSDMicro != 40 || loaded.state.CloudSpendUSDMicro != 70 {
+		t.Fatalf("loaded state = %#v", loaded.state)
+	}
+	if loaded.TodayCloudSpendMicro(now) != 70 {
+		t.Fatalf("today cloud spend = %d, want 70", loaded.TodayCloudSpendMicro(now))
+	}
+
+	if err := os.WriteFile(file, []byte(`{`), 0o600); err != nil {
+		t.Fatalf("write corrupt state: %v", err)
+	}
+	corrupt := newSavingsMeterForTest(file, func() time.Time { return now.Add(time.Hour) })
+	if corrupt.state.SavedUSDMicro != 0 || corrupt.state.Since.IsZero() {
+		t.Fatalf("corrupt recovery state = %#v", corrupt.state)
+	}
+}
+
+func TestBudgetArithmeticRetryAfterAndModeSIGHUP(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 5, 23, 59, 59, 500_000_000, time.UTC)
+	meter := newSavingsMeterForTest("", func() time.Time { return now })
+	meter.RecordCloudUsage(tokenUsage{PromptTokens: 10}, priceQuote{
+		Reference:           "openai/gpt-4o",
+		PromptMicroPerToken: 1,
+		Priced:              true,
+	})
+	if !meter.BudgetExhausted(10, now) {
+		t.Fatal("budget should be exhausted at the cap")
+	}
+	if got := retryAfterUTCMidnight(now); got != 1 {
+		t.Fatalf("Retry-After = %d, want 1", got)
+	}
+
+	control := newCloudControl(config.CloudExplicit)
+	if got := control.EffectiveMode(); got != config.CloudExplicit {
+		t.Fatalf("initial mode = %s", got)
+	}
+	if got := control.HandleSIGHUP(); got != config.CloudOff {
+		t.Fatalf("after disable mode = %s", got)
+	}
+	if got := control.HandleSIGHUP(); got != config.CloudExplicit {
+		t.Fatalf("after restore mode = %s", got)
+	}
+}
+
+func TestStreamingLocalUsageSavingsAndStreamOptions(t *testing.T) {
+	var localBody []byte
+	local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localBody, _ = io.ReadAll(r.Body)
+		var payload struct {
+			StreamOptions struct {
+				IncludeUsage bool `json:"include_usage"`
+			} `json:"stream_options"`
+		}
+		if err := json.Unmarshal(localBody, &payload); err != nil {
+			t.Fatalf("local body JSON: %v\n%s", err, localBody)
+		}
+		if !payload.StreamOptions.IncludeUsage {
+			t.Fatalf("stream_options.include_usage missing in %s", localBody)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"model\":\"llama3\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+	proxy := newProxyWithHandlers(t, config.Config{
+		TRAPIKey:     "tr-key",
+		BurstOnError: true,
+		Aliases:      map[string]string{"openai/gpt-4o": "llama3"},
+	}, local, nil)
+	setCatalogModels(proxy, pricedModel("openai/gpt-4o", "0.000001", "0.000002"))
+
+	resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Bursty-Saved-USD"); got == "" {
+		t.Fatal("missing X-Bursty-Saved-USD")
+	}
+	statsResp, statsBody := get(t, proxy, "/stats", "")
+	if statsResp.StatusCode != http.StatusOK {
+		t.Fatalf("stats status = %d body=%s", statsResp.StatusCode, statsBody)
+	}
+	var statsPayload struct {
+		Savings struct {
+			SavedUSD              float64          `json:"saved_usd"`
+			LocalTokensPrompt     int64            `json:"local_tokens_prompt"`
+			LocalTokensCompletion int64            `json:"local_tokens_completion"`
+			References            map[string]int64 `json:"references"`
+		} `json:"savings"`
+	}
+	if err := json.Unmarshal(statsBody, &statsPayload); err != nil {
+		t.Fatalf("stats JSON: %v\n%s", err, statsBody)
+	}
+	if statsPayload.Savings.SavedUSD != 0.00002 || statsPayload.Savings.LocalTokensPrompt != 10 || statsPayload.Savings.LocalTokensCompletion != 5 {
+		t.Fatalf("savings stats = %#v body=%s", statsPayload.Savings, statsBody)
+	}
+	if statsPayload.Savings.References["openai/gpt-4o"] != 1 {
+		t.Fatalf("references = %#v", statsPayload.Savings.References)
+	}
+}
+
+func TestStreamUsageUnknownAndTokensOnly(t *testing.T) {
+	local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+	proxy := newProxyWithHandlers(t, config.Config{BurstOnError: true}, local, nil)
+
+	resp, body := postChat(t, proxy, `{"model":"llama3","stream":true,"messages":[]}`, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	statsResp, statsBody := get(t, proxy, "/stats", "")
+	if statsResp.StatusCode != http.StatusOK {
+		t.Fatalf("stats status = %d body=%s", statsResp.StatusCode, statsBody)
+	}
+	var statsPayload struct {
+		Savings struct {
+			SavedUSD          float64 `json:"saved_usd"`
+			UsageUnknownTotal int64   `json:"usage_unknown_total"`
+		} `json:"savings"`
+	}
+	if err := json.Unmarshal(statsBody, &statsPayload); err != nil {
+		t.Fatalf("stats JSON: %v\n%s", err, statsBody)
+	}
+	if statsPayload.Savings.UsageUnknownTotal != 1 || statsPayload.Savings.SavedUSD != 0 {
+		t.Fatalf("savings = %#v body=%s", statsPayload.Savings, statsBody)
+	}
+}
+
+func TestCloudModesExplicitAndOff(t *testing.T) {
+	t.Run("explicit blocks automatic burst but allows provider cloud", func(t *testing.T) {
+		enteredLocal := make(chan struct{})
+		releaseLocal := make(chan struct{})
+		var enterOnce sync.Once
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			enterOnce.Do(func() { close(enteredLocal) })
+			<-releaseLocal
+			writeTestJSON(w, http.StatusOK, map[string]any{"id": "local"})
+		})
+		var trCalls atomic.Int64
+		tr := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trCalls.Add(1)
+			writeTestJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+		})
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRAPIKey:            "tr-key",
+			LocalMaxConcurrency: 1,
+			BurstOnError:        true,
+			Cloud:               config.CloudExplicit,
+		}, local, tr)
+
+		firstDone := make(chan struct{})
+		go func() {
+			defer close(firstDone)
+			_, _ = postChat(t, proxy, `{"model":"openai/gpt-4o","messages":[]}`, "")
+		}()
+		<-enteredLocal
+		resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","messages":[]}`, "")
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("automatic burst status = %d body=%s", resp.StatusCode, body)
+		}
+		if trCalls.Load() != 0 {
+			t.Fatalf("tr calls after blocked burst = %d, want 0", trCalls.Load())
+		}
+		close(releaseLocal)
+		<-firstDone
+
+		resp, body = postChat(t, proxy, `{"model":"openai/gpt-4o","provider":{"order":["openai"]},"messages":[]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("explicit cloud status = %d body=%s", resp.StatusCode, body)
+		}
+		if trCalls.Load() != 1 {
+			t.Fatalf("tr calls = %d, want 1", trCalls.Load())
+		}
+		if got := proxy.stats.cloudBlockedMode.Value(); got != 1 {
+			t.Fatalf("cloud_blocked_mode = %d, want 1", got)
+		}
+	})
+
+	t.Run("off blocks explicit cloud", func(t *testing.T) {
+		local, _ := fakeLocal(t)
+		tr, trCalls := fakeTR(t)
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRAPIKey:     "tr-key",
+			BurstOnError: true,
+			Cloud:        config.CloudOff,
+		}, local, tr)
+		resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","provider":{"order":["openai"]},"messages":[]}`, "")
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if !bytes.Contains(body, []byte("cloud disabled by -cloud=off")) {
+			t.Fatalf("body = %s", body)
+		}
+		if trCalls.Load() != 0 {
+			t.Fatalf("tr calls = %d, want 0", trCalls.Load())
+		}
+	})
+}
+
+func TestCloudBudgetBlocksSecondSend(t *testing.T) {
+	tr := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"id":    "tr",
+			"model": "openai/gpt-4o",
+			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 0},
+		})
+	})
+	proxy := newProxyWithHandlers(t, config.Config{
+		TRAPIKey:           "tr-key",
+		BurstOnError:       true,
+		MaxCloudSpendMicro: 1,
+	}, nil, tr)
+	setCatalogModels(proxy, pricedModel("openai/gpt-4o", "0.000001", "0.000001"))
+
+	resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","provider":{"order":["openai"]},"messages":[]}`, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d body=%s", resp.StatusCode, body)
+	}
+	resp, body = postChat(t, proxy, `{"model":"openai/gpt-4o","provider":{"order":["openai"]},"messages":[]}`, "")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d body=%s", resp.StatusCode, body)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After")
+	}
+	if !bytes.Contains(body, []byte("cloud_budget_exhausted")) {
+		t.Fatalf("body = %s", body)
+	}
+	if got := proxy.stats.cloudBlockedBudget.Value(); got != 1 {
+		t.Fatalf("cloud_blocked_budget = %d, want 1", got)
+	}
+}
+
 func TestBurstyJSONInjectionAbsentForStreaming(t *testing.T) {
 	local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var view struct {
@@ -2076,6 +2418,24 @@ func TestXAPIKeyAuth(t *testing.T) {
 	}
 }
 
+func setCatalogModels(proxy *Server, models ...map[string]any) {
+	proxy.models.mu.Lock()
+	defer proxy.models.mu.Unlock()
+	proxy.models.data = models
+	proxy.models.expires = time.Now().Add(time.Hour)
+	proxy.models.hasData = true
+}
+
+func pricedModel(id, prompt, completion string) map[string]any {
+	return map[string]any{
+		"id": id,
+		"pricing": map[string]any{
+			"prompt":     prompt,
+			"completion": completion,
+		},
+	}
+}
+
 func fakeLocal(t *testing.T) (http.Handler, *atomic.Int64) {
 	t.Helper()
 	var calls atomic.Int64
@@ -2127,8 +2487,11 @@ func newProxyWithTransports(t *testing.T, cfg config.Config, localTransport, trT
 	if cfg.TRBaseURL == "" {
 		cfg.TRBaseURL = "http://tr.test/v1"
 	}
+	if cfg.Cloud == "" {
+		cfg.Cloud = config.CloudAuto
+	}
 
-	server := &Server{cfg: cfg, stats: newStats()}
+	server := &Server{cfg: cfg, stats: newStats(), savings: newSavingsMeter(""), cloud: newCloudControl(cfg.Cloud)}
 	if cfg.LocalURL != "" {
 		local, err := upstream.NewLocalWithHTTPClient(cfg.LocalURL, &http.Client{Transport: localTransport})
 		if err != nil {

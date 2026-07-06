@@ -192,6 +192,9 @@ func TestDecideAliases(t *testing.T) {
 		if !got.BurstAllowed || got.BurstSkippedUnmapped {
 			t.Fatalf("burst flags allowed=%v skipped=%v, want true/false", got.BurstAllowed, got.BurstSkippedUnmapped)
 		}
+		if got.AliasKey != "gpt-4o" {
+			t.Fatalf("AliasKey = %q, want gpt-4o", got.AliasKey)
+		}
 	})
 
 	t.Run("local prefix wins over alias", func(t *testing.T) {
@@ -208,7 +211,24 @@ func TestDecideAliases(t *testing.T) {
 		if got.BurstAllowed || got.BurstSkippedUnmapped {
 			t.Fatalf("burst flags allowed=%v skipped=%v, want false/false", got.BurstAllowed, got.BurstSkippedUnmapped)
 		}
+		if got.AliasKey != "" {
+			t.Fatalf("AliasKey = %q, want empty", got.AliasKey)
+		}
 	})
+}
+
+func TestDecideInjectsStreamUsageOnlyIntoLocalBody(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"model":"gpt-4o","stream":true,"messages":[]}`)
+	got, err := Decide(raw, true, true, Options{Aliases: map[string]string{"gpt-4o": "llama3"}})
+	if err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	assertJSONEqual(t, got.LocalBody, []byte(`{"model":"llama3","stream":true,"messages":[],"stream_options":{"include_usage":true}}`))
+	if !bytes.Equal(got.TRBody, raw) {
+		t.Fatalf("TRBody = %s, want original %s", got.TRBody, raw)
+	}
 }
 
 func TestDecideUnmappedLocalModelBurstPolicy(t *testing.T) {

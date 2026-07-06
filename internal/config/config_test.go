@@ -22,6 +22,10 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 		envBurstFallbackModel:  "openai/gpt-4o-mini",
 		envToken:               "env-token",
 		envAliases:             "gpt-4o=llama3.2, anthropic/claude-haiku-4.5=llama3.1",
+		envSavingsReference:    "openai/gpt-4o-mini",
+		envStateFile:           "/tmp/env-state.json",
+		envCloud:               "explicit",
+		envMaxCloudSpend:       "1.25",
 	}
 	cfg, err := Parse([]string{
 		"-listen", ":9999",
@@ -32,6 +36,10 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 		"-burst-fallback-model", "openai/gpt-4o",
 		"-burst-on-error=true",
 		"-alias", "openai/gpt-4.1=qwen2.5-coder:32b",
+		"-savings-reference", "openai/gpt-4.1",
+		"-state-file", "/tmp/flag-state.json",
+		"-cloud", "off",
+		"-max-cloud-spend", "2.50",
 	}, envLookup(env), &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
@@ -50,6 +58,12 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 	}
 	if cfg.BurstFallbackModel != "openai/gpt-4o" {
 		t.Fatalf("burst fallback = %q, want flag value", cfg.BurstFallbackModel)
+	}
+	if cfg.SavingsReference != "openai/gpt-4.1" || cfg.StateFile != "/tmp/flag-state.json" || cfg.Cloud != CloudOff {
+		t.Fatalf("new flag precedence failed: %#v", cfg)
+	}
+	if cfg.MaxCloudSpendMicro != 2_500_000 {
+		t.Fatalf("max cloud spend micro = %d, want 2500000", cfg.MaxCloudSpendMicro)
 	}
 	wantAliases := map[string]string{
 		"gpt-4o":                     "llama3.2",
@@ -73,10 +87,17 @@ func TestParseValidationAndUsage(t *testing.T) {
 	if _, err := Parse([]string{"-h"}, envLookup(nil), &usage); err == nil {
 		t.Fatal("Parse(-h) error = nil, want flag.ErrHelp")
 	}
-	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES"} {
+	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES", "BURSTY_SAVINGS_REFERENCE", "BURSTY_STATE_FILE", "BURSTY_CLOUD", "BURSTY_MAX_CLOUD_SPEND"} {
 		if !strings.Contains(usage.String(), want) {
 			t.Fatalf("usage missing %q:\n%s", want, usage.String())
 		}
+	}
+
+	if _, err := Parse([]string{"-local-url", "http://local", "-cloud", "maybe"}, envLookup(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "auto, explicit, off") {
+		t.Fatalf("invalid cloud mode error = %v", err)
+	}
+	if _, err := Parse([]string{"-local-url", "http://local", "-max-cloud-spend", "-1"}, envLookup(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("invalid max cloud spend error = %v", err)
 	}
 }
 
