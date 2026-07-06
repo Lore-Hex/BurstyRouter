@@ -1600,6 +1600,7 @@ func startBursty(t *testing.T, cfg burstyConfig) *burstyProcess {
 		"-state-file", cfg.stateFile,
 		"-cloud", cloud,
 		"-max-cloud-spend", maxCloudSpend,
+		"-no-autodetect",
 	}
 	for _, alias := range cfg.aliases {
 		args = append(args, "-alias", alias)

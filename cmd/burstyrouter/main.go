@@ -65,7 +65,11 @@ func main() {
 		log.Fatal(err)
 	}
 	if cfg.HasLocal() && localInfo.URL == "" {
-		localInfo = inspectConfiguredLocal(context.Background(), cfg.LocalURL)
+		if cfg.NoAutodetect {
+			localInfo = configuredLocalInfo(cfg.LocalURL)
+		} else {
+			localInfo = inspectConfiguredLocal(context.Background(), cfg.LocalURL)
+		}
 	}
 
 	handler, err := proxy.New(cfg)
@@ -116,14 +120,7 @@ func main() {
 }
 
 func inspectConfiguredLocal(ctx context.Context, rawURL string) localBannerInfo {
-	info := localBannerInfo{
-		URL:             strings.TrimSpace(rawURL),
-		Flavor:          autodetect.GuessFlavor(rawURL),
-		ModelCountKnown: false,
-	}
-	if normalized, err := autodetect.NormalizeBase(rawURL); err == nil {
-		info.URL = normalized
-	}
+	info := configuredLocalInfo(rawURL)
 	result, err := autodetect.ProbeServer(ctx, autodetect.Probe{Name: info.Flavor, URL: rawURL}, autodetect.DefaultProbeTimeout, nil)
 	if err != nil {
 		return info
@@ -132,6 +129,18 @@ func inspectConfiguredLocal(ctx context.Context, rawURL string) localBannerInfo 
 	info.Flavor = result.Name
 	info.ModelCount = result.ModelCount
 	info.ModelCountKnown = true
+	return info
+}
+
+func configuredLocalInfo(rawURL string) localBannerInfo {
+	info := localBannerInfo{
+		URL:             strings.TrimSpace(rawURL),
+		Flavor:          autodetect.GuessFlavor(rawURL),
+		ModelCountKnown: false,
+	}
+	if normalized, err := autodetect.NormalizeBase(rawURL); err == nil {
+		info.URL = normalized
+	}
 	return info
 }
 

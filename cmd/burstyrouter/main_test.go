@@ -50,3 +50,16 @@ func TestPrintBootBannerGolden(t *testing.T) {
 		t.Fatalf("banner has %d lines, want <= 10:\n%s", lines, got)
 	}
 }
+
+func TestConfiguredLocalInfoDoesNotRequireProbe(t *testing.T) {
+	info := configuredLocalInfo("127.0.0.1:11434")
+	if info.URL != "http://127.0.0.1:11434/v1" {
+		t.Fatalf("URL = %q", info.URL)
+	}
+	if info.Flavor != "Ollama" {
+		t.Fatalf("Flavor = %q", info.Flavor)
+	}
+	if info.ModelCountKnown {
+		t.Fatal("ModelCountKnown = true, want false")
+	}
+}

@@ -126,13 +126,17 @@ func TranslateResponse(raw []byte, visibleModel string) ([]byte, Usage, error) {
 			HasUsage:         true,
 		}
 	}
+	stopReason := mapOpenAIFinishReason(choice.FinishReason)
+	if len(choice.Message.ToolCalls) > 0 {
+		stopReason = "tool_use"
+	}
 	out := messageResponse{
 		ID:         makeMessageID(),
 		Type:       "message",
 		Role:       "assistant",
 		Model:      visibleModel,
 		Content:    blocks,
-		StopReason: mapOpenAIFinishReason(choice.FinishReason),
+		StopReason: stopReason,
 		Usage: responseUsage{
 			InputTokens:  usage.PromptTokens,
 			OutputTokens: usage.CompletionTokens,
@@ -152,6 +156,19 @@ func responseContentText(raw json.RawMessage) string {
 	var text string
 	if err := json.Unmarshal(raw, &text); err == nil {
 		return text
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		var out strings.Builder
+		for _, part := range parts {
+			if part.Text != "" {
+				out.WriteString(part.Text)
+			}
+		}
+		return out.String()
 	}
 	return ""
 }

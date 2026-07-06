@@ -23,7 +23,7 @@ func TestRealOllamaLocalModel(t *testing.T) {
 
 	chatBody := mustJSON(t, map[string]any{
 		"model":      model,
-		"max_tokens": 8,
+		"max_tokens": 256,
 		"stream":     false,
 		"messages": []map[string]string{
 			{"role": "user", "content": "Reply with one short word."},
@@ -54,7 +54,7 @@ func TestRealOllamaLocalModel(t *testing.T) {
 
 	streamBody := mustJSON(t, map[string]any{
 		"model":      model,
-		"max_tokens": 8,
+		"max_tokens": 256,
 		"stream":     true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "Reply with one short word."},
@@ -80,7 +80,7 @@ func TestRealOllamaLocalModel(t *testing.T) {
 
 	messagesBody := mustJSON(t, map[string]any{
 		"model":      model,
-		"max_tokens": 8,
+		"max_tokens": 256,
 		"messages": []map[string]string{
 			{"role": "user", "content": "Reply with one short word."},
 		},
@@ -106,7 +106,7 @@ func TestRealOllamaLocalModel(t *testing.T) {
 
 	messagesStreamBody := mustJSON(t, map[string]any{
 		"model":      model,
-		"max_tokens": 8,
+		"max_tokens": 256,
 		"stream":     true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "Reply with one short word."},
@@ -169,7 +169,7 @@ func TestRealOllamaSlowFirstByteHedges(t *testing.T) {
 
 	chatBody := mustJSON(t, map[string]any{
 		"model":      "openai/gpt-4o",
-		"max_tokens": 8,
+		"max_tokens": 256,
 		"stream":     true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "Reply with one short word."},

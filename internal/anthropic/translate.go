@@ -271,7 +271,7 @@ func translateMessage(message anthropicMessage) ([]openAIMessage, error) {
 				leftover.WriteString(block.Text)
 			}
 		}
-		if leftover.String() != "" {
+		if strings.TrimSpace(leftover.String()) != "" {
 			out = append(out, openAIMessage{Role: "user", Content: leftover.String()})
 		}
 		return out, nil

@@ -13,7 +13,7 @@ const maxStreamLineBytes = 1 << 20
 type openAIStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content          string                      `json:"content"`
+			Content          json.RawMessage             `json:"content"`
 			ReasoningContent string                      `json:"reasoning_content"`
 			ToolCalls        []openAIStreamToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
@@ -35,12 +35,12 @@ type openAIStreamToolCallDelta struct {
 type streamTranslator struct {
 	w              io.Writer
 	nextBlockIndex int
-	openBlockIndex int
-	hasOpenBlock   bool
 	textIndex      *int
 	thinkingIndex  *int
 	toolIndexes    map[int]int
 	toolCalls      map[int]*toolAccumulator
+	openedBlocks   []int
+	openedBlockSet map[int]struct{}
 }
 
 type toolAccumulator struct {
@@ -67,9 +67,10 @@ func TranslateStream(r io.Reader, w io.Writer, visibleModel string) (Usage, erro
 	}
 
 	state := &streamTranslator{
-		w:           w,
-		toolIndexes: map[int]int{},
-		toolCalls:   map[int]*toolAccumulator{},
+		w:              w,
+		toolIndexes:    map[int]int{},
+		toolCalls:      map[int]*toolAccumulator{},
+		openedBlockSet: map[int]struct{}{},
 	}
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxStreamLineBytes)
@@ -88,7 +89,7 @@ func TranslateStream(r io.Reader, w io.Writer, visibleModel string) (Usage, erro
 
 		var chunk openAIStreamChunk
 		if err := decodeUseNumber([]byte(payload), &chunk); err != nil {
-			_ = state.closeOpenBlock()
+			_ = state.closeAllBlocks()
 			_ = writeStreamError(w, fmt.Sprintf("malformed OpenAI stream chunk: %v", err))
 			return finalUsage, err
 		}
@@ -109,8 +110,8 @@ func TranslateStream(r io.Reader, w io.Writer, visibleModel string) (Usage, erro
 				return finalUsage, err
 			}
 		}
-		if choice.Delta.Content != "" {
-			if err := state.writeTextDelta(choice.Delta.Content); err != nil {
+		if text := responseContentText(choice.Delta.Content); text != "" {
+			if err := state.writeTextDelta(text); err != nil {
 				return finalUsage, err
 			}
 		}
@@ -124,12 +125,15 @@ func TranslateStream(r io.Reader, w io.Writer, visibleModel string) (Usage, erro
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		_ = state.closeOpenBlock()
+		_ = state.closeAllBlocks()
 		_ = writeStreamError(w, fmt.Sprintf("read OpenAI stream: %v", err))
 		return finalUsage, err
 	}
-	if err := state.closeOpenBlock(); err != nil {
+	if err := state.closeAllBlocks(); err != nil {
 		return finalUsage, err
+	}
+	if state.hasToolBlocks() {
+		stopReason = "tool_use"
 	}
 	if err := writeEvent(w, "message_delta", messageDeltaEvent{
 		Type:  "message_delta",
@@ -156,9 +160,6 @@ func (s *streamTranslator) writeTextDelta(text string) error {
 			return err
 		}
 	}
-	if err := s.switchTo(*s.textIndex); err != nil {
-		return err
-	}
 	return writeEvent(s.w, "content_block_delta", contentBlockDeltaEvent{
 		Type:  "content_block_delta",
 		Index: *s.textIndex,
@@ -174,9 +175,6 @@ func (s *streamTranslator) writeThinkingDelta(text string) error {
 		if err := s.startBlock(index, thinkingBlock{Type: "thinking", Thinking: ""}); err != nil {
 			return err
 		}
-	}
-	if err := s.switchTo(*s.thinkingIndex); err != nil {
-		return err
 	}
 	return writeEvent(s.w, "content_block_delta", contentBlockDeltaEvent{
 		Type:  "content_block_delta",
@@ -210,9 +208,6 @@ func (s *streamTranslator) writeToolDelta(delta openAIStreamToolCallDelta) error
 		call.Name = delta.Function.Name
 	}
 	index := s.toolIndexes[delta.Index]
-	if err := s.switchTo(index); err != nil {
-		return err
-	}
 	if delta.Function.Arguments == "" {
 		return nil
 	}
@@ -225,8 +220,8 @@ func (s *streamTranslator) writeToolDelta(delta openAIStreamToolCallDelta) error
 }
 
 func (s *streamTranslator) startBlock(index int, block any) error {
-	if err := s.closeOpenBlock(); err != nil {
-		return err
+	if _, ok := s.openedBlockSet[index]; ok {
+		return nil
 	}
 	if err := writeEvent(s.w, "content_block_start", contentBlockStartEvent{
 		Type:         "content_block_start",
@@ -235,33 +230,27 @@ func (s *streamTranslator) startBlock(index int, block any) error {
 	}); err != nil {
 		return err
 	}
-	s.hasOpenBlock = true
-	s.openBlockIndex = index
+	s.openedBlockSet[index] = struct{}{}
+	s.openedBlocks = append(s.openedBlocks, index)
 	return nil
 }
 
-func (s *streamTranslator) switchTo(index int) error {
-	if s.hasOpenBlock && s.openBlockIndex == index {
-		return nil
+func (s *streamTranslator) closeAllBlocks() error {
+	for _, index := range s.openedBlocks {
+		if err := writeEvent(s.w, "content_block_stop", contentBlockStopEvent{
+			Type:  "content_block_stop",
+			Index: index,
+		}); err != nil {
+			return err
+		}
+		delete(s.openedBlockSet, index)
 	}
-	if err := s.closeOpenBlock(); err != nil {
-		return err
-	}
-	s.hasOpenBlock = true
-	s.openBlockIndex = index
+	s.openedBlocks = nil
 	return nil
 }
 
-func (s *streamTranslator) closeOpenBlock() error {
-	if !s.hasOpenBlock {
-		return nil
-	}
-	index := s.openBlockIndex
-	s.hasOpenBlock = false
-	return writeEvent(s.w, "content_block_stop", contentBlockStopEvent{
-		Type:  "content_block_stop",
-		Index: index,
-	})
+func (s *streamTranslator) hasToolBlocks() bool {
+	return len(s.toolCalls) > 0
 }
 
 func writeStreamError(w io.Writer, message string) error {

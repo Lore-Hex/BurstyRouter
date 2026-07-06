@@ -209,14 +209,14 @@ func TestTranslateStreamGolden(t *testing.T) {
 		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}` + "\n\n" +
 		"event: content_block_delta\n" +
 		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}` + "\n\n" +
-		"event: content_block_stop\n" +
-		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
 		"event: content_block_start\n" +
 		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{}}}` + "\n\n" +
 		"event: content_block_delta\n" +
 		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{"}}` + "\n\n" +
 		"event: content_block_delta\n" +
 		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"q\":\"a\"}"}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
 		"event: content_block_stop\n" +
 		`data: {"type":"content_block_stop","index":1}` + "\n\n" +
 		"event: message_delta\n" +
@@ -228,6 +228,133 @@ func TestTranslateStreamGolden(t *testing.T) {
 	}
 	if !usage.HasUsage || usage.PromptTokens != 10 || usage.CompletionTokens != 4 || usage.CachedTokens != 6 {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestTranslateStreamInterleavedToolCallsKeepBlocksOpen(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"first","arguments":"{\"a\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"second","arguments":"{\"b\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+	var out bytes.Buffer
+	if _, err := TranslateStream(strings.NewReader(input), &out, "claude"); err != nil {
+		t.Fatalf("TranslateStream() error = %v\n%s", err, out.String())
+	}
+	events := parseSSEEvents(t, out.String())
+	assertWellFormedContentBlocks(t, events)
+	assertEventIndexes(t, events, "content_block_start", []int{0, 1})
+	assertEventIndexes(t, events, "content_block_stop", []int{0, 1})
+	if got := partialJSONByIndex(t, events); got[0] != `{"a":1}` || got[1] != `{"b":2}` {
+		t.Fatalf("partial JSON by index = %#v", got)
+	}
+	if got := stopReason(t, events); got != "tool_use" {
+		t.Fatalf("stop_reason = %q, want tool_use", got)
+	}
+}
+
+func TestTranslateStreamContentAfterToolCallKeepsBlocksOpen(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"hello "}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+		`data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+	var out bytes.Buffer
+	if _, err := TranslateStream(strings.NewReader(input), &out, "claude"); err != nil {
+		t.Fatalf("TranslateStream() error = %v\n%s", err, out.String())
+	}
+	events := parseSSEEvents(t, out.String())
+	assertWellFormedContentBlocks(t, events)
+	assertEventIndexes(t, events, "content_block_start", []int{0, 1})
+	assertEventIndexes(t, events, "content_block_stop", []int{0, 1})
+	if got := textByIndex(t, events)[0]; got != "hello done" {
+		t.Fatalf("text index 0 = %q, want %q", got, "hello done")
+	}
+	if got := partialJSONByIndex(t, events)[1]; got != `{}` {
+		t.Fatalf("tool JSON index 1 = %q, want {}", got)
+	}
+	if got := stopReason(t, events); got != "tool_use" {
+		t.Fatalf("stop_reason = %q, want tool_use", got)
+	}
+}
+
+func TestTranslateStreamToolCallsForceToolUseStopReason(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+	var out bytes.Buffer
+	if _, err := TranslateStream(strings.NewReader(input), &out, "claude"); err != nil {
+		t.Fatalf("TranslateStream() error = %v\n%s", err, out.String())
+	}
+	if got := stopReason(t, parseSSEEvents(t, out.String())); got != "tool_use" {
+		t.Fatalf("stream stop_reason = %q, want tool_use", got)
+	}
+}
+
+func TestTranslateResponseToolCallsForceStopAndParseMultipleInputs(t *testing.T) {
+	withFixedMessageID(t, "msg_test")
+
+	raw := []byte(`{
+		"model":"llama3",
+		"choices":[{
+			"message":{
+				"content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}],
+				"tool_calls":[
+					{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"a\"}"}},
+					{"id":"call_2","type":"function","function":{"name":"save","arguments":"{\"n\":2}"}}
+				]
+			},
+			"finish_reason":"stop"
+		}],
+		"usage":{"prompt_tokens":11,"completion_tokens":3}
+	}`)
+	got, _, err := TranslateResponse(raw, "anthropic/claude-haiku-4.5")
+	if err != nil {
+		t.Fatalf("TranslateResponse() error = %v", err)
+	}
+	want := []byte(`{
+		"id":"msg_test",
+		"type":"message",
+		"role":"assistant",
+		"model":"anthropic/claude-haiku-4.5",
+		"content":[
+			{"type":"text","text":"hello world"},
+			{"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"a"}},
+			{"type":"tool_use","id":"call_2","name":"save","input":{"n":2}}
+		],
+		"stop_reason":"tool_use",
+		"stop_sequence":null,
+		"usage":{"input_tokens":11,"output_tokens":3}
+	}`)
+	assertJSONEqual(t, got, want)
+}
+
+func TestTranslateRequestAssistantToolOnlyContentIsEmptyString(t *testing.T) {
+	got, err := TranslateRequest([]byte(`{
+		"model":"llama3",
+		"max_tokens":8,
+		"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"a"}}]}]
+	}`))
+	if err != nil {
+		t.Fatalf("TranslateRequest() error = %v", err)
+	}
+	var payload openAIChatRequest
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("translated JSON: %v\n%s", err, got)
+	}
+	if len(payload.Messages) != 1 {
+		t.Fatalf("messages = %#v", payload.Messages)
+	}
+	content, ok := payload.Messages[0].Content.(string)
+	if !ok || content != "" {
+		t.Fatalf("assistant content = %#v (%T), want empty string", payload.Messages[0].Content, payload.Messages[0].Content)
 	}
 }
 
@@ -274,5 +401,168 @@ func assertJSONEqual(t *testing.T, got, want []byte) {
 	wantCanonical, _ := json.Marshal(wantAny)
 	if !bytes.Equal(gotCanonical, wantCanonical) {
 		t.Fatalf("JSON = %s, want %s", gotCanonical, wantCanonical)
+	}
+}
+
+type sseEvent struct {
+	name string
+	data map[string]any
+}
+
+func parseSSEEvents(t *testing.T, stream string) []sseEvent {
+	t.Helper()
+	records := strings.Split(strings.TrimSpace(stream), "\n\n")
+	events := make([]sseEvent, 0, len(records))
+	for _, record := range records {
+		if strings.TrimSpace(record) == "" {
+			continue
+		}
+		var event sseEvent
+		for _, line := range strings.Split(record, "\n") {
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				event.name = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event.data); err != nil {
+					t.Fatalf("SSE data JSON: %v\nrecord:\n%s", err, record)
+				}
+			}
+		}
+		if event.name == "" || event.data == nil {
+			t.Fatalf("malformed SSE record:\n%s", record)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func assertWellFormedContentBlocks(t *testing.T, events []sseEvent) {
+	t.Helper()
+	started := map[int]bool{}
+	stopped := map[int]bool{}
+	for _, event := range events {
+		switch event.name {
+		case "content_block_start":
+			index := eventIndex(t, event)
+			if started[index] {
+				t.Fatalf("content block %d started more than once", index)
+			}
+			if stopped[index] {
+				t.Fatalf("content block %d started after stop", index)
+			}
+			started[index] = true
+		case "content_block_delta":
+			index := eventIndex(t, event)
+			if !started[index] {
+				t.Fatalf("content block %d received delta before start", index)
+			}
+			if stopped[index] {
+				t.Fatalf("content block %d received delta after stop", index)
+			}
+		case "content_block_stop":
+			index := eventIndex(t, event)
+			if !started[index] {
+				t.Fatalf("content block %d stopped before start", index)
+			}
+			if stopped[index] {
+				t.Fatalf("content block %d stopped more than once", index)
+			}
+			stopped[index] = true
+		}
+	}
+	for index := range started {
+		if !stopped[index] {
+			t.Fatalf("content block %d was not stopped", index)
+		}
+	}
+}
+
+func assertEventIndexes(t *testing.T, events []sseEvent, name string, want []int) {
+	t.Helper()
+	got := []int{}
+	for _, event := range events {
+		if event.name == name {
+			got = append(got, eventIndex(t, event))
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s indexes = %#v, want %#v", name, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s indexes = %#v, want %#v", name, got, want)
+		}
+	}
+}
+
+func partialJSONByIndex(t *testing.T, events []sseEvent) map[int]string {
+	t.Helper()
+	out := map[int]string{}
+	for _, event := range events {
+		if event.name != "content_block_delta" {
+			continue
+		}
+		delta, ok := event.data["delta"].(map[string]any)
+		if !ok || delta["type"] != "input_json_delta" {
+			continue
+		}
+		partial, _ := delta["partial_json"].(string)
+		out[eventIndex(t, event)] += partial
+	}
+	return out
+}
+
+func textByIndex(t *testing.T, events []sseEvent) map[int]string {
+	t.Helper()
+	out := map[int]string{}
+	for _, event := range events {
+		if event.name != "content_block_delta" {
+			continue
+		}
+		delta, ok := event.data["delta"].(map[string]any)
+		if !ok || delta["type"] != "text_delta" {
+			continue
+		}
+		text, _ := delta["text"].(string)
+		out[eventIndex(t, event)] += text
+	}
+	return out
+}
+
+func stopReason(t *testing.T, events []sseEvent) string {
+	t.Helper()
+	for _, event := range events {
+		if event.name != "message_delta" {
+			continue
+		}
+		delta, ok := event.data["delta"].(map[string]any)
+		if !ok {
+			t.Fatalf("message_delta missing delta: %#v", event.data)
+		}
+		reason, _ := delta["stop_reason"].(string)
+		return reason
+	}
+	t.Fatal("message_delta not found")
+	return ""
+}
+
+func eventIndex(t *testing.T, event sseEvent) int {
+	t.Helper()
+	value, ok := event.data["index"]
+	if !ok {
+		t.Fatalf("%s missing index: %#v", event.name, event.data)
+	}
+	switch n := value.(type) {
+	case float64:
+		return int(n)
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			t.Fatalf("index is not an integer: %v", err)
+		}
+		return int(i)
+	default:
+		t.Fatalf("index has type %T: %#v", value, value)
+		return 0
 	}
 }
