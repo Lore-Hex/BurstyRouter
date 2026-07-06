@@ -339,4 +339,4 @@ X-Bursty-Route: local
 X-Bursty-Reason: policy
 ```
 
-Reasons: `policy`, `forced`, `burst-full`, `burst-error`.
+Reasons: `policy`, `forced`, `burst-full`, `burst-error`, `burst-slow`.

@@ -91,6 +91,51 @@ func TestRealOllamaLocalModel(t *testing.T) {
 	}
 }
 
+func TestRealOllamaSlowFirstByteHedges(t *testing.T) {
+	ollamaURL := strings.TrimRight(strings.TrimSpace(os.Getenv("BURSTY_E2E_OLLAMA_URL")), "/")
+	if ollamaURL == "" {
+		t.Skip("BURSTY_E2E_OLLAMA_URL is unset")
+	}
+	model := firstOllamaModel(t, ollamaURL)
+
+	trLog := &requestLog{}
+	tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		trLog.add(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: tr\n\n"))
+	}))
+	defer tr.Close()
+
+	proc := startBursty(t, burstyConfig{
+		localURL:       ollamaURL,
+		trAPIKey:       "e2e-tr-key",
+		trBaseURL:      tr.URL + "/v1",
+		trCatalogURL:   tr.URL + "/v1",
+		localSlowAfter: time.Millisecond,
+		aliases:        []string{"openai/gpt-4o=" + model},
+	})
+
+	chatBody := mustJSON(t, map[string]any{
+		"model":      "openai/gpt-4o",
+		"max_tokens": 8,
+		"stream":     true,
+		"messages": []map[string]string{
+			{"role": "user", "content": "Reply with one short word."},
+		},
+	})
+	resp, body := postChatWithTimeout(t, proc, chatBody, nil, 30*time.Second)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	assertRoute(t, resp, "trustedrouter", "burst-slow")
+	if !strings.Contains(string(body), "data: tr") {
+		t.Fatalf("body = %q, want TrustedRouter stream", body)
+	}
+	if trLog.count() != 1 {
+		t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+	}
+}
+
 func firstOllamaModel(t *testing.T, ollamaURL string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -22,6 +22,7 @@ const (
 	ReasonPolicy     Reason = "policy"
 	ReasonBurstFull  Reason = "burst-full"
 	ReasonBurstError Reason = "burst-error"
+	ReasonBurstSlow  Reason = "burst-slow"
 )
 
 // ProviderDirective is the minimal provider routing shape BurstyRouter needs.

@@ -25,6 +25,7 @@ Alternates: `go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest
 | Local-native id with `-burst-fallback-model` set | Can burst; BurstyRouter substitutes the fallback model only in the burst body. |
 | Local semaphore full | Bursts to TrustedRouter when not forced, TR is configured, and the model is burst-capable; otherwise returns `429`. |
 | Local connect error, `429`, `5xx`, or model-missing `404` | Bursts to TrustedRouter when `-burst-on-error=true`, not forced, TR is configured, and the model is burst-capable. |
+| Local headers arrive but the first body byte exceeds `-local-slow-after` | Bursts to TrustedRouter when the deadline is enabled, not forced, cloud egress is allowed, TR is configured, and the model is burst-capable. |
 | `/v1/messages` or `/v1/responses` | TrustedRouter-only raw passthrough; local-forced requests return `400`, local-only mode returns `501`, and upstream `404` maps to a Bursty `501`. |
 
 ## Configuration
@@ -38,6 +39,7 @@ Alternates: `go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest
 | `-tr-catalog-url` | `BURSTY_TR_CATALOG_URL` | `https://trustedrouter.com/v1` |
 | `-local-max-concurrency` | `BURSTY_LOCAL_MAX_CONCURRENCY` | `4` |
 | `-local-queue-wait` | `BURSTY_LOCAL_QUEUE_WAIT` | `0s` |
+| `-local-slow-after` | `BURSTY_LOCAL_SLOW_AFTER` | `0s` |
 | `-burst-on-error` | `BURSTY_BURST_ON_ERROR` | `true` |
 | `-burst-fallback-model` | `BURSTY_BURST_FALLBACK_MODEL` | `""` |
 | `-alias from=to` | `BURSTY_ALIASES=a=b,c=d` | `""` |
@@ -114,11 +116,11 @@ X-Bursty-Route: local
 X-Bursty-Reason: policy
 ```
 
-Routes are `local` or `trustedrouter`. Reasons are `policy`, `forced`, `burst-full`, or `burst-error`. Streaming responses pass through byte-for-byte and use headers only.
+Routes are `local` or `trustedrouter`. Reasons are `policy`, `forced`, `burst-full`, `burst-error`, or `burst-slow`. Streaming responses pass through byte-for-byte and use headers only.
 
 ## Stats
 
-`GET /stats` reports `in_flight_local`, `bursts_full`, `bursts_error`, `bursts_skipped_unmapped`, `forced_local`, `forced_tr`, `requests_total`, `cloud_mode`, `cloud_blocked_budget`, `cloud_blocked_mode`, `savings`, global `routes`, and `endpoint_routes` for `chat_completions`, `embeddings`, `messages`, and `responses`.
+`GET /stats` reports `in_flight_local`, `bursts_full`, `bursts_error`, `bursts_slow`, `bursts_skipped_unmapped`, `forced_local`, `forced_tr`, `requests_total`, `cloud_mode`, `cloud_blocked_budget`, `cloud_blocked_mode`, `savings`, global `routes`, and `endpoint_routes` for `chat_completions`, `embeddings`, `messages`, and `responses`.
 
 ## Setup
 

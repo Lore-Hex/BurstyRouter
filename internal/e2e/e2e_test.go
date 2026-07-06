@@ -530,6 +530,138 @@ func TestBinaryBurstOnError(t *testing.T) {
 	})
 }
 
+func TestBinarySlowLocalFirstByte(t *testing.T) {
+	t.Run("slow default hedges before local bytes reach client", func(t *testing.T) {
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-r.Context().Done():
+			}
+			_, _ = w.Write([]byte("data: local\n\n"))
+			w.(http.Flusher).Flush()
+		}))
+		defer local.Close()
+
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: tr\n\n"))
+		}))
+		defer tr.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL:       local.URL,
+			trAPIKey:       "e2e-tr-key",
+			trBaseURL:      tr.URL + "/v1",
+			trCatalogURL:   tr.URL + "/v1",
+			localSlowAfter: 20 * time.Millisecond,
+		})
+
+		resp, body := postChatWithTimeout(t, proc, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, nil, 2*time.Second)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "trustedrouter", "burst-slow")
+		if !bytes.Equal(body, []byte("data: tr\n\n")) {
+			t.Fatalf("body = %q, want TrustedRouter stream only", body)
+		}
+		if bytes.Contains(body, []byte("local")) {
+			t.Fatalf("client received local bytes after hedge: %q", body)
+		}
+		if trLog.count() != 1 {
+			t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+		}
+		statsResp, statsBody := get(t, proc, "/stats", nil)
+		if statsResp.StatusCode != http.StatusOK {
+			t.Fatalf("stats status = %d body=%s", statsResp.StatusCode, statsBody)
+		}
+		var stats struct {
+			BurstsSlow int64 `json:"bursts_slow"`
+		}
+		if err := json.Unmarshal(statsBody, &stats); err != nil {
+			t.Fatalf("stats JSON: %v\n%s", err, statsBody)
+		}
+		if stats.BurstsSlow != 1 {
+			t.Fatalf("bursts_slow = %d, want 1; stats=%s", stats.BurstsSlow, statsBody)
+		}
+	})
+
+	t.Run("fast first byte stays local", func(t *testing.T) {
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: local\n\n"))
+		}))
+		defer local.Close()
+
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			writeJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+		}))
+		defer tr.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL:       local.URL,
+			trAPIKey:       "e2e-tr-key",
+			trBaseURL:      tr.URL + "/v1",
+			trCatalogURL:   tr.URL + "/v1",
+			localSlowAfter: time.Second,
+		})
+
+		resp, body := postChat(t, proc, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "local", "policy")
+		if !bytes.Equal(body, []byte("data: local\n\n")) {
+			t.Fatalf("body = %q, want local stream", body)
+		}
+		if trLog.count() != 0 {
+			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		}
+	})
+
+	t.Run("forced local waits", func(t *testing.T) {
+		local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			time.Sleep(50 * time.Millisecond)
+			_, _ = w.Write([]byte(`{"id":"local"}`))
+		}))
+		defer local.Close()
+
+		trLog := &requestLog{}
+		tr := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trLog.add(r)
+			writeJSON(w, http.StatusOK, map[string]any{"id": "tr"})
+		}))
+		defer tr.Close()
+
+		proc := startBursty(t, burstyConfig{
+			localURL:       local.URL,
+			trAPIKey:       "e2e-tr-key",
+			trBaseURL:      tr.URL + "/v1",
+			trCatalogURL:   tr.URL + "/v1",
+			localSlowAfter: 10 * time.Millisecond,
+		})
+
+		resp, body := postChat(t, proc, `{"model":"local/llama3","messages":[]}`, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		assertRoute(t, resp, "local", "forced")
+		assertBurstyBlock(t, body, "local", "forced")
+		if trLog.count() != 0 {
+			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		}
+	})
+}
+
 func TestBinaryForcedLocalFailureDoesNotBurst(t *testing.T) {
 	local := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "local failed"})
@@ -1164,6 +1296,7 @@ type burstyConfig struct {
 	trCatalogURL        string
 	localMaxConcurrency int
 	localQueueWait      time.Duration
+	localSlowAfter      time.Duration
 	burstOnError        *bool
 	token               string
 	aliases             []string
@@ -1219,6 +1352,7 @@ func startBursty(t *testing.T, cfg burstyConfig) *burstyProcess {
 		"-tr-catalog-url", trCatalogURL,
 		"-local-max-concurrency", strconv.Itoa(maxConcurrency),
 		"-local-queue-wait", cfg.localQueueWait.String(),
+		"-local-slow-after", cfg.localSlowAfter.String(),
 		"-burst-on-error=" + strconv.FormatBool(burstOnError),
 		"-token", cfg.token,
 		"-burst-fallback-model", cfg.burstFallbackModel,
@@ -1457,7 +1591,7 @@ func assertStatsShape(t *testing.T, body []byte) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("stats JSON: %v\n%s", err, body)
 	}
-	for _, key := range []string{"in_flight_local", "bursts_full", "bursts_error", "bursts_skipped_unmapped", "forced_local", "forced_tr", "requests_total", "catalog_errors", "cloud_blocked_budget", "cloud_blocked_mode", "cloud_mode", "savings", "routes", "endpoint_routes"} {
+	for _, key := range []string{"in_flight_local", "bursts_full", "bursts_error", "bursts_slow", "bursts_skipped_unmapped", "forced_local", "forced_tr", "requests_total", "catalog_errors", "cloud_blocked_budget", "cloud_blocked_mode", "cloud_mode", "savings", "routes", "endpoint_routes"} {
 		if _, ok := payload[key]; !ok {
 			t.Fatalf("stats missing key %q: %#v", key, payload)
 		}

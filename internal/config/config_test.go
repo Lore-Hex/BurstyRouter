@@ -18,6 +18,7 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 		envTRCatalogURL:        "http://env-catalog/v1",
 		envLocalMaxConcurrency: "9",
 		envLocalQueueWait:      "250ms",
+		envLocalSlowAfter:      "750ms",
 		envBurstOnError:        "false",
 		envBurstFallbackModel:  "openai/gpt-4o-mini",
 		envToken:               "env-token",
@@ -33,6 +34,7 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 		"-tr-catalog-url", "http://flag-catalog/v1",
 		"-local-max-concurrency", "2",
 		"-local-queue-wait", "1s",
+		"-local-slow-after", "2s",
 		"-burst-fallback-model", "openai/gpt-4o",
 		"-burst-on-error=true",
 		"-alias", "openai/gpt-4.1=qwen2.5-coder:32b",
@@ -54,7 +56,7 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 	if cfg.TRCatalogURL != "http://flag-catalog/v1" {
 		t.Fatalf("tr catalog URL = %q, want flag value", cfg.TRCatalogURL)
 	}
-	if cfg.LocalQueueWait != time.Second || !cfg.BurstOnError {
+	if cfg.LocalQueueWait != time.Second || cfg.LocalSlowAfter != 2*time.Second || !cfg.BurstOnError {
 		t.Fatalf("duration/bool parse failed: %#v", cfg)
 	}
 	if cfg.BurstFallbackModel != "openai/gpt-4o" {
@@ -91,7 +93,7 @@ func TestParseValidationAndUsage(t *testing.T) {
 	if _, err := Parse([]string{"-h"}, envLookup(nil), &usage); err == nil {
 		t.Fatal("Parse(-h) error = nil, want flag.ErrHelp")
 	}
-	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES", "BURSTY_SAVINGS_REFERENCE", "BURSTY_STATE_FILE", "BURSTY_CLOUD", "BURSTY_MAX_CLOUD_SPEND", "-no-autodetect", "-version"} {
+	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_LOCAL_SLOW_AFTER", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES", "BURSTY_SAVINGS_REFERENCE", "BURSTY_STATE_FILE", "BURSTY_CLOUD", "BURSTY_MAX_CLOUD_SPEND", "-no-autodetect", "-version"} {
 		if !strings.Contains(usage.String(), want) {
 			t.Fatalf("usage missing %q:\n%s", want, usage.String())
 		}
@@ -109,6 +111,9 @@ func TestParseValidationAndUsage(t *testing.T) {
 	}
 	if _, err := Parse([]string{"-local-url", "http://local", "-max-cloud-spend", "-1"}, envLookup(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("invalid max cloud spend error = %v", err)
+	}
+	if _, err := Parse([]string{"-local-url", "http://local", "-local-slow-after", "-1s"}, envLookup(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("invalid local slow after error = %v", err)
 	}
 }
 
