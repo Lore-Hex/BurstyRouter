@@ -40,6 +40,7 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 		"-state-file", "/tmp/flag-state.json",
 		"-cloud", "off",
 		"-max-cloud-spend", "2.50",
+		"-no-autodetect",
 	}, envLookup(env), &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
@@ -65,6 +66,9 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 	if cfg.MaxCloudSpendMicro != 2_500_000 {
 		t.Fatalf("max cloud spend micro = %d, want 2500000", cfg.MaxCloudSpendMicro)
 	}
+	if !cfg.NoAutodetect {
+		t.Fatalf("no autodetect = false, want true")
+	}
 	wantAliases := map[string]string{
 		"gpt-4o":                     "llama3.2",
 		"anthropic/claude-haiku-4.5": "llama3.1",
@@ -80,17 +84,24 @@ func TestParseFlagEnvPrecedence(t *testing.T) {
 func TestParseValidationAndUsage(t *testing.T) {
 	t.Parallel()
 
-	if _, err := Parse(nil, envLookup(nil), &bytes.Buffer{}); err == nil {
-		t.Fatal("Parse() without upstream succeeded")
+	if _, err := Parse(nil, envLookup(nil), &bytes.Buffer{}); err != nil {
+		t.Fatalf("Parse() without upstream error = %v, want deferred runtime validation", err)
 	}
 	var usage bytes.Buffer
 	if _, err := Parse([]string{"-h"}, envLookup(nil), &usage); err == nil {
 		t.Fatal("Parse(-h) error = nil, want flag.ErrHelp")
 	}
-	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES", "BURSTY_SAVINGS_REFERENCE", "BURSTY_STATE_FILE", "BURSTY_CLOUD", "BURSTY_MAX_CLOUD_SPEND"} {
+	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES", "BURSTY_SAVINGS_REFERENCE", "BURSTY_STATE_FILE", "BURSTY_CLOUD", "BURSTY_MAX_CLOUD_SPEND", "-no-autodetect", "-version"} {
 		if !strings.Contains(usage.String(), want) {
 			t.Fatalf("usage missing %q:\n%s", want, usage.String())
 		}
+	}
+	cfg, err := Parse([]string{"-version"}, envLookup(nil), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("Parse(-version) error = %v", err)
+	}
+	if !cfg.PrintVersion {
+		t.Fatalf("PrintVersion = false, want true")
 	}
 
 	if _, err := Parse([]string{"-local-url", "http://local", "-cloud", "maybe"}, envLookup(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "auto, explicit, off") {
@@ -98,6 +109,26 @@ func TestParseValidationAndUsage(t *testing.T) {
 	}
 	if _, err := Parse([]string{"-local-url", "http://local", "-max-cloud-spend", "-1"}, envLookup(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("invalid max cloud spend error = %v", err)
+	}
+}
+
+func TestValidateRuntime(t *testing.T) {
+	t.Parallel()
+
+	for _, cfg := range []Config{
+		{LocalURL: "http://local"},
+		{TRAPIKey: "tr-key"},
+	} {
+		if err := ValidateRuntime(cfg); err != nil {
+			t.Fatalf("ValidateRuntime(%#v) error = %v", cfg, err)
+		}
+	}
+
+	if err := ValidateRuntime(Config{}); err == nil || !strings.Contains(err.Error(), "no local OpenAI-compatible server found") {
+		t.Fatalf("ValidateRuntime(no upstream) error = %v", err)
+	}
+	if err := ValidateRuntime(Config{NoAutodetect: true}); err == nil || !strings.Contains(err.Error(), "remove -no-autodetect") {
+		t.Fatalf("ValidateRuntime(no autodetect) error = %v", err)
 	}
 }
 

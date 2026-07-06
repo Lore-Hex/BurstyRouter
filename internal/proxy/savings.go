@@ -264,6 +264,18 @@ func (m *savingsMeter) Totals() (savedMicro int64, cloudSpendMicro int64, topRef
 	return m.state.SavedUSDMicro, m.state.CloudSpendUSDMicro, topReferenceLocked(m.references)
 }
 
+func (m *savingsMeter) HasHistory() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state.SavedUSDMicro != 0 ||
+		m.state.LocalPromptTokens != 0 ||
+		m.state.LocalCompletionTokens != 0 ||
+		m.state.CloudSpendUSDMicro != 0 ||
+		m.state.CloudPromptTokens != 0 ||
+		m.state.CloudCompletionTokens != 0 ||
+		len(m.state.CloudSpendUSDMicroByUTCDay) != 0
+}
+
 func (m *savingsMeter) FlushIfDirty() error {
 	if m.file == "" {
 		return nil

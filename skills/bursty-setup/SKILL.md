@@ -28,26 +28,34 @@ After the user answers, show only:
 Install:
 
 ```bash
-go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest
+brew tap Lore-Hex/homebrew-tap
+brew install burstyrouter
 ```
 
-If Go install is not desired, tell the user to download the latest release binary from:
+If Homebrew is not desired, tell the user to download the latest release binary from:
 
 ```text
 https://github.com/Lore-Hex/BurstyRouter/releases/latest
 ```
 
+Other install paths:
+
+```bash
+go install github.com/Lore-Hex/BurstyRouter/cmd/burstyrouter@latest
+docker build -t burstyrouter:local .
+```
+
 Ollama local-only:
 
 ```bash
-burstyrouter -local-url http://127.0.0.1:11434
+burstyrouter
 ```
 
 Local plus TrustedRouter burst:
 
 ```bash
 export TRUSTEDROUTER_API_KEY="tr_..."
-burstyrouter -local-url http://127.0.0.1:11434 -tr-api-key "$TRUSTEDROUTER_API_KEY"
+burstyrouter -tr-api-key "$TRUSTEDROUTER_API_KEY"
 ```
 
 Local plus aliases for cloud-facing model names:
@@ -75,7 +83,7 @@ TrustedRouter-only:
 
 ```bash
 export TRUSTEDROUTER_API_KEY="tr_..."
-burstyrouter -tr-api-key "$TRUSTEDROUTER_API_KEY"
+burstyrouter -no-autodetect -tr-api-key "$TRUSTEDROUTER_API_KEY"
 ```
 
 Verify local process:
