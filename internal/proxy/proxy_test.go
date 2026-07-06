@@ -1051,6 +1051,147 @@ func TestBurstOnError(t *testing.T) {
 	})
 }
 
+func TestFirstBodyByteRace(t *testing.T) {
+	t.Run("slow first byte signals slow", func(t *testing.T) {
+		reader, writer := io.Pipe()
+		race := startFirstBodyByteRace(reader)
+		body, slow, err := race.waitWithin(10 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("waitWithin() error = %v", err)
+		}
+		if !slow {
+			t.Fatal("waitWithin() slow = false, want true")
+		}
+		_ = body.Close()
+		_ = writer.Close()
+	})
+
+	t.Run("fast first byte is preserved", func(t *testing.T) {
+		race := startFirstBodyByteRace(io.NopCloser(strings.NewReader("abc")))
+		body, slow, err := race.waitWithin(time.Second)
+		if err != nil {
+			t.Fatalf("waitWithin() error = %v", err)
+		}
+		if slow {
+			t.Fatal("waitWithin() slow = true, want false")
+		}
+		data, err := io.ReadAll(body)
+		if err != nil {
+			t.Fatalf("ReadAll() error = %v", err)
+		}
+		if string(data) != "abc" {
+			t.Fatalf("body = %q, want abc", data)
+		}
+	})
+}
+
+func TestSlowLocalFirstByte(t *testing.T) {
+	t.Run("slow eligible local bursts", func(t *testing.T) {
+		localDone := make(chan struct{})
+		var localBytes atomic.Int64
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-r.Context().Done():
+			}
+			n, _ := w.Write([]byte("data: local\n\n"))
+			localBytes.Add(int64(n))
+			close(localDone)
+		})
+		var trCalls atomic.Int64
+		tr := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: tr\n\n"))
+		})
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRAPIKey:       "tr-key",
+			LocalSlowAfter: 10 * time.Millisecond,
+		}, local, tr)
+
+		resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if resp.Header.Get("X-Bursty-Route") != "trustedrouter" || resp.Header.Get("X-Bursty-Reason") != "burst-slow" {
+			t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+		}
+		if !bytes.Equal(body, []byte("data: tr\n\n")) {
+			t.Fatalf("body = %q, want TrustedRouter stream only", body)
+		}
+		if trCalls.Load() != 1 {
+			t.Fatalf("tr calls = %d, want 1", trCalls.Load())
+		}
+		if got := proxy.stats.burstsSlow.Value(); got != 1 {
+			t.Fatalf("bursts_slow = %d, want 1", got)
+		}
+		select {
+		case <-localDone:
+		case <-time.After(time.Second):
+			t.Fatal("local handler did not finish after hedge cancellation")
+		}
+		if got := localBytes.Load(); got != 0 {
+			t.Fatalf("local bytes written after hedge = %d, want 0", got)
+		}
+	})
+
+	t.Run("fast first byte stays local", func(t *testing.T) {
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: local\n\n"))
+		})
+		tr, trCalls := fakeTR(t)
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRAPIKey:       "tr-key",
+			LocalSlowAfter: time.Second,
+		}, local, tr)
+
+		resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if resp.Header.Get("X-Bursty-Route") != "local" || resp.Header.Get("X-Bursty-Reason") != "policy" {
+			t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+		}
+		if !bytes.Equal(body, []byte("data: local\n\n")) {
+			t.Fatalf("body = %q, want local stream", body)
+		}
+		if trCalls.Load() != 0 {
+			t.Fatalf("tr calls = %d, want 0", trCalls.Load())
+		}
+	})
+
+	t.Run("forced local waits and does not hedge", func(t *testing.T) {
+		local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			time.Sleep(50 * time.Millisecond)
+			_, _ = w.Write([]byte(`{"id":"local"}`))
+		})
+		tr, trCalls := fakeTR(t)
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRAPIKey:       "tr-key",
+			LocalSlowAfter: 10 * time.Millisecond,
+		}, local, tr)
+
+		resp, body := postChat(t, proxy, `{"model":"local/llama3","messages":[]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		}
+		if resp.Header.Get("X-Bursty-Route") != "local" || resp.Header.Get("X-Bursty-Reason") != "forced" {
+			t.Fatalf("route headers = %s/%s", resp.Header.Get("X-Bursty-Route"), resp.Header.Get("X-Bursty-Reason"))
+		}
+		assertBurstyBlock(t, body, "local", "forced")
+		if trCalls.Load() != 0 {
+			t.Fatalf("tr calls = %d, want 0", trCalls.Load())
+		}
+	})
+}
+
 func TestBurstOnErrorReleasesLocalSlotBeforeTrustedRouterCompletes(t *testing.T) {
 	enteredTR := make(chan struct{})
 	releaseTR := make(chan struct{})

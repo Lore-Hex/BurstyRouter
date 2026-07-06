@@ -24,6 +24,7 @@ const (
 	envTRCatalogURL        = "BURSTY_TR_CATALOG_URL"
 	envLocalMaxConcurrency = "BURSTY_LOCAL_MAX_CONCURRENCY"
 	envLocalQueueWait      = "BURSTY_LOCAL_QUEUE_WAIT"
+	envLocalSlowAfter      = "BURSTY_LOCAL_SLOW_AFTER"
 	envBurstOnError        = "BURSTY_BURST_ON_ERROR"
 	envBurstFallbackModel  = "BURSTY_BURST_FALLBACK_MODEL"
 	envToken               = "BURSTY_TOKEN"
@@ -55,6 +56,7 @@ type Config struct {
 	TRCatalogURL        string
 	LocalMaxConcurrency int
 	LocalQueueWait      time.Duration
+	LocalSlowAfter      time.Duration
 	BurstOnError        bool
 	BurstFallbackModel  string
 	Token               string
@@ -92,6 +94,7 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 	fs.StringVar(&cfg.TRCatalogURL, "tr-catalog-url", cfg.TRCatalogURL, "TrustedRouter public catalog base URL")
 	fs.IntVar(&cfg.LocalMaxConcurrency, "local-max-concurrency", cfg.LocalMaxConcurrency, "in-flight cap on local upstream")
 	fs.DurationVar(&cfg.LocalQueueWait, "local-queue-wait", cfg.LocalQueueWait, "how long to wait for a local slot before bursting")
+	fs.DurationVar(&cfg.LocalSlowAfter, "local-slow-after", cfg.LocalSlowAfter, "burst when local response body does not produce its first byte within this duration; 0 disables")
 	fs.BoolVar(&cfg.BurstOnError, "burst-on-error", cfg.BurstOnError, "burst to TrustedRouter on local connect error/timeout/429/5xx/404-model")
 	fs.StringVar(&cfg.BurstFallbackModel, "burst-fallback-model", cfg.BurstFallbackModel, "TrustedRouter model to use when bursting an unmapped local-native model")
 	fs.StringVar(&cfg.Token, "token", cfg.Token, "optional inbound bearer token")
@@ -111,6 +114,7 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 		fmt.Fprintf(output, "  -tr-catalog-url            env BURSTY_TR_CATALOG_URL          default %s\n", DefaultTRCatalogURL)
 		fmt.Fprintln(output, "  -local-max-concurrency     env BURSTY_LOCAL_MAX_CONCURRENCY   default 4")
 		fmt.Fprintln(output, "  -local-queue-wait          env BURSTY_LOCAL_QUEUE_WAIT        default 0s")
+		fmt.Fprintln(output, "  -local-slow-after          env BURSTY_LOCAL_SLOW_AFTER        default 0s")
 		fmt.Fprintln(output, "  -burst-on-error            env BURSTY_BURST_ON_ERROR          default true")
 		fmt.Fprintln(output, "  -burst-fallback-model      env BURSTY_BURST_FALLBACK_MODEL    default \"\"")
 		fmt.Fprintln(output, "  -token                     env BURSTY_TOKEN                   default \"\"")
@@ -171,6 +175,13 @@ func defaultsFromEnv(lookupEnv func(string) (string, bool)) (Config, error) {
 		}
 		cfg.LocalQueueWait = parsed
 	}
+	if value, ok := lookupEnv(envLocalSlowAfter); ok {
+		parsed, err := time.ParseDuration(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %w", envLocalSlowAfter, err)
+		}
+		cfg.LocalSlowAfter = parsed
+	}
 	if value, ok := lookupEnv(envBurstOnError); ok {
 		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -223,6 +234,9 @@ func validate(cfg Config) error {
 	}
 	if cfg.LocalQueueWait < 0 {
 		return errors.New("-local-queue-wait must not be negative")
+	}
+	if cfg.LocalSlowAfter < 0 {
+		return errors.New("-local-slow-after must not be negative")
 	}
 	if err := validateCloudMode(cfg.Cloud); err != nil {
 		return err

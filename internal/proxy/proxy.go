@@ -300,7 +300,10 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 	}
 	defer releaseLocalSlot()
 
-	resp, err := endpoint.localPost(r.Context(), decision.LocalBody, r.Header)
+	localCtx, cancelLocal := context.WithCancel(r.Context())
+	defer cancelLocal()
+
+	resp, err := endpoint.localPost(localCtx, decision.LocalBody, r.Header)
 	if err != nil {
 		if !forced && s.cfg.BurstOnError && s.tr != nil {
 			if decision.BurstAllowed {
@@ -320,7 +323,7 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 		writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", err.Error(), "api_error")
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	shouldBurst, err := shouldBurstLocalResponse(resp, decision.View.Model)
 	if err != nil {
@@ -348,6 +351,41 @@ func (s *Server) serveLocalCapable(w http.ResponseWriter, r *http.Request, decis
 		closeBurstResponseBody(resp)
 		writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", fmt.Sprintf("local upstream returned status %d", resp.StatusCode), "api_error")
 		return
+	}
+
+	if forced && s.cfg.LocalSlowAfter > 0 {
+		resp.Body = logSlowFirstByteReadCloser(resp.Body, s.cfg.LocalSlowAfter, decision.View.Model)
+	} else if s.shouldHedgeSlowLocal(decision, resp) {
+		race := startFirstBodyByteRace(resp.Body)
+		body, slow, err := race.waitWithin(s.cfg.LocalSlowAfter)
+		if err != nil {
+			writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", err.Error(), "api_error")
+			return
+		}
+		resp.Body = body
+		if slow {
+			switch s.allowAutomaticCloud(w, policy.ReasonBurstSlow) {
+			case cloudAllowed:
+				s.stats.burstsSlow.Add(1)
+				cancelLocal()
+				closeBurstResponseBody(resp)
+				releaseLocalSlot()
+				s.serveTrustedRouterRaw(w, r, endpoint.trPath, decision.TRBody, decision.View.Stream, policy.ReasonBurstSlow, endpoint.family, decision)
+				return
+			case cloudBlockedBudget:
+				cancelLocal()
+				closeBurstResponseBody(resp)
+				releaseLocalSlot()
+				return
+			case cloudBlockedMode:
+				body, err := race.wait()
+				if err != nil {
+					writeRoutedError(w, policy.RouteLocal, decision.Reason, http.StatusBadGateway, "local_upstream_error", err.Error(), "api_error")
+					return
+				}
+				resp.Body = body
+			}
+		}
 	}
 
 	s.serveUpstreamResponse(w, r, resp, policy.RouteLocal, decision.Reason, decision.View.Stream, endpoint.family, decision)
@@ -599,6 +637,26 @@ func (s *Server) countSkippedUnmapped(decision policy.Decision) {
 	if decision.BurstSkippedUnmapped {
 		s.stats.burstsSkippedUnmapped.Add(1)
 	}
+}
+
+func (s *Server) shouldHedgeSlowLocal(decision policy.Decision, resp *http.Response) bool {
+	if s.cfg.LocalSlowAfter <= 0 || s.tr == nil || !decision.BurstAllowed {
+		return false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	if s.cloud != nil && s.cloud.EffectiveMode() != config.CloudAuto {
+		return false
+	}
+	return !s.cloudBudgetExhausted()
+}
+
+func (s *Server) cloudBudgetExhausted() bool {
+	if s.savings == nil || s.cfg.MaxCloudSpendMicro <= 0 {
+		return false
+	}
+	return s.savings.BudgetExhausted(s.cfg.MaxCloudSpendMicro, time.Now().UTC())
 }
 
 func shouldBurstLocalResponse(resp *http.Response, model string) (bool, error) {
@@ -915,6 +973,107 @@ func closeBurstResponseBody(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
+type firstBodyByteRace struct {
+	body io.ReadCloser
+	done chan firstBodyByteRead
+}
+
+type firstBodyByteRead struct {
+	buf [1]byte
+	n   int
+	err error
+}
+
+func startFirstBodyByteRace(body io.ReadCloser) *firstBodyByteRace {
+	race := &firstBodyByteRace{
+		body: body,
+		done: make(chan firstBodyByteRead, 1),
+	}
+	go func() {
+		var buf [1]byte
+		n, err := body.Read(buf[:])
+		race.done <- firstBodyByteRead{buf: buf, n: n, err: err}
+	}()
+	return race
+}
+
+func (r *firstBodyByteRace) waitWithin(timeout time.Duration) (io.ReadCloser, bool, error) {
+	if timeout <= 0 {
+		return r.body, false, nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case result := <-r.done:
+		body, err := r.bodyAfter(result)
+		return body, false, err
+	case <-timer.C:
+		return r.body, true, nil
+	}
+}
+
+func (r *firstBodyByteRace) wait() (io.ReadCloser, error) {
+	result := <-r.done
+	return r.bodyAfter(result)
+}
+
+func (r *firstBodyByteRace) bodyAfter(result firstBodyByteRead) (io.ReadCloser, error) {
+	if result.n > 0 {
+		return readCloser{
+			Reader: io.MultiReader(bytes.NewReader(result.buf[:result.n]), r.body),
+			Closer: r.body,
+		}, nil
+	}
+	if result.err != nil && !errors.Is(result.err, io.EOF) {
+		return r.body, result.err
+	}
+	return r.body, nil
+}
+
+type firstByteLogReadCloser struct {
+	io.ReadCloser
+	done  chan struct{}
+	once  sync.Once
+	timer *time.Timer
+}
+
+func logSlowFirstByteReadCloser(body io.ReadCloser, timeout time.Duration, model string) io.ReadCloser {
+	wrapped := &firstByteLogReadCloser{
+		ReadCloser: body,
+		done:       make(chan struct{}),
+	}
+	wrapped.timer = time.AfterFunc(timeout, func() {
+		select {
+		case <-wrapped.done:
+		default:
+			log.Printf("bursty local: forced local first byte exceeded %s for model=%s; waiting for local", timeout, model)
+		}
+	})
+	return wrapped
+}
+
+func (r *firstByteLogReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 || err != nil {
+		r.markDone()
+	}
+	return n, err
+}
+
+func (r *firstByteLogReadCloser) Close() error {
+	r.markDone()
+	return r.ReadCloser.Close()
+}
+
+func (r *firstByteLogReadCloser) markDone() {
+	r.once.Do(func() {
+		close(r.done)
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+	})
+}
+
 type readCloser struct {
 	io.Reader
 	io.Closer
@@ -956,6 +1115,7 @@ type stats struct {
 	inFlightLocal         expvar.Int
 	burstsFull            expvar.Int
 	burstsError           expvar.Int
+	burstsSlow            expvar.Int
 	burstsSkippedUnmapped expvar.Int
 	forcedLocal           expvar.Int
 	forcedTR              expvar.Int
@@ -1015,6 +1175,7 @@ func (s *stats) snapshot() map[string]any {
 		"in_flight_local":         s.inFlightLocal.Value(),
 		"bursts_full":             s.burstsFull.Value(),
 		"bursts_error":            s.burstsError.Value(),
+		"bursts_slow":             s.burstsSlow.Value(),
 		"bursts_skipped_unmapped": s.burstsSkippedUnmapped.Value(),
 		"forced_local":            s.forcedLocal.Value(),
 		"forced_tr":               s.forcedTR.Value(),
