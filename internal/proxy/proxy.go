@@ -141,8 +141,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleStats(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/v1/") && !s.authorized(w, r) {
+	if r.URL.Path == "/metrics" {
+		if !s.authorized(w, r) {
+			return
+		}
+		s.handleMetrics(w, r)
 		return
+	}
+	if r.URL.Path == "/ui" {
+		if !s.authorized(w, r) {
+			return
+		}
+		s.handleUI(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/") {
+		if !s.authorized(w, r) {
+			return
+		}
+		w = &recentDecisionWriter{ResponseWriter: w, stats: s.stats, path: r.URL.Path}
 	}
 
 	switch r.URL.Path {
@@ -188,6 +205,22 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cloud != nil {
 		payload["cloud_mode"] = string(s.cloud.EffectiveMode())
+	}
+	if s.local != nil {
+		payload["local_capacity"] = s.cfg.LocalMaxConcurrency
+	} else {
+		payload["local_capacity"] = 0
+	}
+	if s.cfg.MaxCloudSpendMicro > 0 {
+		remaining := s.cfg.MaxCloudSpendMicro
+		if s.savings != nil {
+			remaining -= s.savings.TodayCloudSpendMicro(time.Now().UTC())
+		}
+		if remaining < 0 {
+			remaining = 0
+		}
+		payload["cloud_budget_usd"] = microToUSD(s.cfg.MaxCloudSpendMicro)
+		payload["cloud_budget_remaining_usd"] = microToUSD(remaining)
 	}
 	writeJSON(w, http.StatusOK, payload)
 }
@@ -968,6 +1001,7 @@ type stats struct {
 	embeddingRoutes       routeStats
 	messageRoutes         routeStats
 	responseRoutes        routeStats
+	recent                recentDecisions
 }
 
 func newStats() *stats {
@@ -1029,6 +1063,7 @@ func (s *stats) snapshot() map[string]any {
 			string(endpointMessages):        s.messageRoutes.snapshot(),
 			string(endpointResponses):       s.responseRoutes.snapshot(),
 		},
+		"recent": s.recent.snapshot(recentDecisionCap),
 	}
 }
 

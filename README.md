@@ -84,6 +84,8 @@ If that upstream does not implement `/v1/messages` or `/v1/responses`, BurstyRou
 | --- | --- |
 | `GET /healthz` | Local health metadata. |
 | `GET /stats` | Bursty counters; bearer-protected when `BURSTY_TOKEN` is set. |
+| `GET /ui` | Read-only savings dashboard; bearer-protected when `BURSTY_TOKEN` is set. |
+| `GET /metrics` | Prometheus text metrics; bearer-protected when `BURSTY_TOKEN` is set. |
 | `GET /v1/models` | Merged local and TrustedRouter model list. |
 | `POST /v1/chat/completions` | Local-capable, burst-capable. |
 | `POST /v1/embeddings` | Local-capable, burst-capable. |
@@ -114,7 +116,13 @@ Routes are `local` or `trustedrouter`. Reasons are `policy`, `forced`, `burst-fu
 
 ## Stats
 
-`GET /stats` reports `in_flight_local`, `bursts_full`, `bursts_error`, `bursts_skipped_unmapped`, `forced_local`, `forced_tr`, `requests_total`, `cloud_mode`, `cloud_blocked_budget`, `cloud_blocked_mode`, `savings`, global `routes`, and `endpoint_routes` for `chat_completions`, `embeddings`, `messages`, and `responses`.
+`GET /stats` reports `in_flight_local`, `local_capacity`, `bursts_full`, `bursts_error`, `bursts_skipped_unmapped`, `forced_local`, `forced_tr`, `requests_total`, `cloud_mode`, `cloud_blocked_budget`, `cloud_blocked_mode`, `savings`, global `routes`, `endpoint_routes` for `chat_completions`, `embeddings`, `messages`, and `responses`, and a bounded `recent` feed of the last routing decisions.
+
+## Dashboards
+
+Open `http://127.0.0.1:8383/ui` for the read-only savings odometer and live routing feed. If `BURSTY_TOKEN` is set, serve it with the same bearer token used for `/stats`.
+
+Prometheus can scrape `GET /metrics`, which exposes `bursty_requests_total`, `bursty_in_flight_local`, route, burst, savings, token, unknown-usage, cloud-spend, and cloud-blocked metrics. Import [docs/grafana-dashboard.json](docs/grafana-dashboard.json) for a starter Grafana dashboard with savings, local-vs-cloud rate, in-flight, and cloud-spend panels.
 
 ## Setup
 

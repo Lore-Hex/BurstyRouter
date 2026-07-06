@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+<title>BurstyRouter</title>
+<style>
+:root{color-scheme:light;--bg:#f6f7f4;--panel:#fff;--ink:#17201d;--muted:#66736b;--line:#dfe5dd;--local:#0b8f68;--cloud:#3158c9;--warn:#b85f14;--bad:#b63c3c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}main{width:min(1120px,calc(100% - 32px));margin:24px auto 20px}header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}h1,h2{margin:0;text-wrap:balance}h1{font-size:22px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}.status{min-height:24px;color:var(--muted);font-variant-numeric:tabular-nums}.grid{display:grid;grid-template-columns:1.15fr .85fr;gap:12px}.panel{background:var(--panel);border-radius:8px;box-shadow:0 1px 2px rgba(0,0,0,.06),0 12px 32px rgba(23,32,29,.08);padding:16px}.hero{min-height:226px;display:flex;flex-direction:column;justify-content:space-between}.odometer{font-size:clamp(48px,9vw,96px);font-weight:760;letter-spacing:0;font-variant-numeric:tabular-nums;line-height:.98}.meta{color:var(--muted);text-wrap:pretty}.row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px}.num{font-variant-numeric:tabular-nums}.bar,.gauge{height:12px;background:#e7ebe6;border-radius:6px;overflow:hidden;box-shadow:inset 0 0 0 1px rgba(0,0,0,.04)}.bar span,.gauge span{display:block;height:100%;width:0;transition-property:width;transition-duration:.35s;transition-timing-function:cubic-bezier(.2,0,0,1)}.bar span{background:linear-gradient(90deg,var(--local),#35a67f)}.gauge span{background:linear-gradient(90deg,var(--warn),var(--cloud))}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px}.metric strong{display:block;font-size:24px;font-variant-numeric:tabular-nums}.metric small{color:var(--muted)}.feed{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:8px;max-height:430px;overflow:auto}.feed li{display:grid;grid-template-columns:84px 1fr auto;gap:10px;align-items:center;padding:9px 0;border-bottom:1px solid var(--line)}.pill{display:inline-flex;align-items:center;justify-content:center;min-height:24px;padding:0 8px;border-radius:6px;font-weight:650;font-size:12px}.local{background:rgba(11,143,104,.12);color:var(--local)}.trustedrouter{background:rgba(49,88,201,.12);color:var(--cloud)}.reason{color:var(--muted)}.path{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bad{color:var(--bad)}footer{margin-top:16px;color:var(--muted);font-size:12px}@media(max-width:820px){main{width:min(100% - 24px,640px);margin-top:16px}.grid,.cards{grid-template-columns:1fr}.odometer{font-size:54px}.feed li{grid-template-columns:76px 1fr}.feed time{display:none}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div><h1>BurstyRouter</h1><div class="meta">Local-first routing status</div></div>
+<div id="status" class="status" aria-live="polite">Loading...</div>
+</header>
+<section class="grid" aria-label="BurstyRouter status">
+<div class="panel hero">
+<div>
+<h2>Saved</h2>
+<div id="savings-odometer" class="odometer">$0.0000</div>
+<div id="savings-meta" class="meta">since process start</div>
+</div>
+<div id="references" class="meta">no priced reference yet</div>
+</div>
+<div class="panel">
+<h2>Local vs cloud</h2>
+<div class="row"><span id="split-counts" class="num">0 local / 0 cloud</span><strong id="split-pct" class="num">0% local</strong></div>
+<div class="bar" aria-hidden="true"><span id="split-local"></span></div>
+<div class="cards">
+<div class="metric"><strong id="inflight" class="num">0/0</strong><small>in flight / capacity</small><div class="gauge"><span id="flight-gauge"></span></div></div>
+<div class="metric"><strong id="cloud-mode">auto</strong><small>cloud mode</small></div>
+<div class="metric"><strong id="cloud-spend" class="num">$0.0000</strong><small>cloud spend</small></div>
+<div class="metric"><strong id="budget-left" class="num">uncapped</strong><small>budget remaining</small></div>
+</div>
+</div>
+<div class="panel" style="grid-column:1/-1">
+<h2>Recent routing decisions</h2>
+<ol id="feed" class="feed"></ol>
+</div>
+</section>
+<footer>READ-ONLY status page.</footer>
+</main>
+<script>
+(()=>{"use strict";let token="",asked=false;const $=id=>document.getElementById(id),money=v=>{v=Number(v)||0;return "$"+v.toLocaleString(void 0,{minimumFractionDigits:v<1?4:2,maximumFractionDigits:6})},setText=(id,text)=>{$(id).textContent=text};async function poll(){try{const headers={Accept:"application/json"};if(token)headers.Authorization="Bearer "+token;let res=await fetch("/stats",{headers,cache:"no-store"});if(res.status===401&&!asked){asked=true;const entered=prompt("BurstyRouter token");if(entered){token=entered.trim();return poll()}}if(!res.ok)throw new Error("HTTP "+res.status);render(await res.json());setText("status","updated "+new Date().toLocaleTimeString())}catch(err){setText("status",err.message||String(err))}}function render(s){const savings=s.savings||{},routes=s.routes||{},local=Number(routes.local)||0,cloud=Number(routes.trustedrouter)||0,total=local+cloud,pct=total?local/total*100:0;setText("savings-odometer",money(savings.saved_usd));setText("savings-meta",savings.since?"since "+new Date(savings.since).toLocaleString():"since process start");const refs=savings.references||{},refText=Object.keys(refs).sort().map(k=>k+" x"+refs[k]).join(", ");setText("references",refText||"no priced reference yet");setText("split-counts",local+" local / "+cloud+" cloud");setText("split-pct",pct.toFixed(total?1:0)+"% local");$("split-local").style.width=Math.max(0,Math.min(100,pct))+"%";const inflight=Number(s.in_flight_local)||0,cap=Number(s.local_capacity)||0,used=cap?Math.min(100,inflight/cap*100):0;setText("inflight",inflight+"/"+cap);$("flight-gauge").style.width=used+"%";setText("cloud-mode",s.cloud_mode||"auto");setText("cloud-spend",money(savings.cloud_spend_usd));setText("budget-left",s.cloud_budget_remaining_usd===void 0?"uncapped":money(s.cloud_budget_remaining_usd));renderFeed(s.recent||[])}function renderFeed(items){const feed=$("feed");feed.replaceChildren();items.slice(0,20).forEach(d=>{const li=document.createElement("li"),pill=document.createElement("span"),mid=document.createElement("span"),time=document.createElement("time");pill.className="pill "+(d.route||"");pill.textContent=d.route==="trustedrouter"?"cloud":d.route||"route";mid.textContent="";const reason=document.createElement("span"),path=document.createElement("div");reason.className="reason";reason.textContent=(d.reason||"policy")+" - "+(d.status||0);path.className="path";path.textContent=d.path||"";mid.append(reason,path);time.className=Number(d.status)>=400?"bad":"num";time.textContent=d.at?new Date(d.at).toLocaleTimeString():"";li.append(pill,mid,time);feed.append(li)});if(!feed.children.length){const li=document.createElement("li");li.textContent="No routed requests yet";feed.append(li)}}poll();setInterval(poll,2000)})();
+</script>
+</body>
+</html>
