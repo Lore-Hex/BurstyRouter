@@ -114,6 +114,7 @@ Without `BURSTY_TOKEN`:
 ```bash
 export BURSTY_HOST="http://127.0.0.1:8383"
 curl -fsS "$BURSTY_HOST/healthz"
+curl -fsS "$BURSTY_HOST/ui" >/dev/null
 curl -fsS "$BURSTY_HOST/v1/models"
 curl -is "$BURSTY_HOST/v1/chat/completions" \
   -H "Content-Type: application/json" \
@@ -126,6 +127,7 @@ With `BURSTY_TOKEN`:
 ```bash
 export BURSTY_HOST="http://127.0.0.1:8383"
 curl -fsS "$BURSTY_HOST/healthz"
+curl -fsS -H "Authorization: Bearer $BURSTY_TOKEN" "$BURSTY_HOST/ui" >/dev/null
 curl -fsS -H "Authorization: Bearer $BURSTY_TOKEN" "$BURSTY_HOST/v1/models"
 curl -is "$BURSTY_HOST/v1/chat/completions" \
   -H "Authorization: Bearer $BURSTY_TOKEN" \
@@ -133,6 +135,8 @@ curl -is "$BURSTY_HOST/v1/chat/completions" \
   -d '{"model":"local/llama3.2","messages":[{"role":"user","content":"ping"}]}' \
   | awk 'BEGIN{found=0} /^X-Bursty-Route:/ {print; found=1} END{exit found?0:1}'
 ```
+
+Open `$BURSTY_HOST/ui` as the "it's working" screen. It is read-only and shows the savings odometer, local/cloud split, local capacity, cloud spend, and recent routing decisions.
 
 With `x-api-key`:
 

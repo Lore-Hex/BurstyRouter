@@ -117,6 +117,21 @@ func TestBinaryHealthStatsAndRoutingMatrix(t *testing.T) {
 	}
 	assertStatsShape(t, body)
 
+	resp, body = get(t, proc, "/ui", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ui status = %d body=%s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`id="savings-odometer"`)) {
+		t.Fatalf("ui missing odometer element")
+	}
+	resp, body = get(t, proc, "/metrics", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d body=%s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte("bursty_requests_total")) {
+		t.Fatalf("metrics missing requests counter: %s", body)
+	}
+
 	defaultBody := `{"model":"llama3","messages":[{"role":"user","content":"hello"}]}`
 	resp, body = postChat(t, proc, defaultBody, nil)
 	if resp.StatusCode != http.StatusOK {

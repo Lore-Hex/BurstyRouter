@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2082,6 +2083,142 @@ func TestStatsEndpointRouteCounters(t *testing.T) {
 	}
 }
 
+func TestMetricsFormatAndValues(t *testing.T) {
+	proxy := &Server{
+		cfg:     config.Config{Cloud: config.CloudAuto},
+		stats:   newStats(),
+		savings: newSavingsMeter(""),
+		cloud:   newCloudControl(config.CloudAuto),
+	}
+	proxy.stats.requestsTotal.Add(7)
+	proxy.stats.inFlightLocal.Add(2)
+	proxy.stats.routes.local.Add(3)
+	proxy.stats.routes.tr.Add(4)
+	proxy.stats.burstsFull.Add(1)
+	proxy.stats.burstsError.Add(2)
+	proxy.stats.burstsSkippedUnmapped.Add(3)
+	proxy.stats.cloudBlockedBudget.Add(5)
+	proxy.stats.cloudBlockedMode.Add(6)
+	proxy.savings.RecordLocalUsage(tokenUsage{PromptTokens: 10, CompletionTokens: 20}, priceQuote{
+		Reference:               "openai/gpt-4o",
+		PromptMicroPerToken:     1,
+		CompletionMicroPerToken: 1,
+		Priced:                  true,
+	})
+	proxy.savings.RecordCloudUsage(tokenUsage{PromptTokens: 5, CompletionTokens: 6}, priceQuote{
+		Reference:               "openai/gpt-4o",
+		PromptMicroPerToken:     2,
+		CompletionMicroPerToken: 3,
+		Priced:                  true,
+	})
+	proxy.savings.RecordUnknownUsage()
+
+	resp, body := get(t, proxy, "/metrics", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain; version=0.0.4") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if !bytes.Contains(body, []byte("# TYPE bursty_in_flight_local gauge")) {
+		t.Fatalf("metrics missing in-flight gauge TYPE:\n%s", body)
+	}
+	metrics := parsePromMetrics(t, body)
+	assertPromMetric(t, metrics, "bursty_requests_total", "7")
+	assertPromMetric(t, metrics, `bursty_in_flight_local`, "2")
+	assertPromMetric(t, metrics, `bursty_route_total{route="local"}`, "3")
+	assertPromMetric(t, metrics, `bursty_route_total{route="trustedrouter"}`, "4")
+	assertPromMetric(t, metrics, `bursty_bursts_total{reason="full"}`, "1")
+	assertPromMetric(t, metrics, `bursty_bursts_total{reason="error"}`, "2")
+	assertPromMetric(t, metrics, `bursty_bursts_total{reason="skipped_unmapped"}`, "3")
+	assertPromMetric(t, metrics, `bursty_saved_usd_total`, "0.000030")
+	assertPromMetric(t, metrics, `bursty_cloud_spend_usd_total`, "0.000028")
+	assertPromMetric(t, metrics, `bursty_local_tokens_total{kind="prompt"}`, "10")
+	assertPromMetric(t, metrics, `bursty_local_tokens_total{kind="completion"}`, "20")
+	assertPromMetric(t, metrics, `bursty_usage_unknown_total`, "1")
+	assertPromMetric(t, metrics, `bursty_cloud_blocked_total{reason="budget"}`, "5")
+	assertPromMetric(t, metrics, `bursty_cloud_blocked_total{reason="mode"}`, "6")
+}
+
+func TestMetricsTokenGate(t *testing.T) {
+	local, _ := fakeLocal(t)
+	proxy := newProxyWithHandlers(t, config.Config{
+		BurstOnError: true,
+		Token:        "secret",
+	}, local, nil)
+
+	resp, body := get(t, proxy, "/metrics", "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("metrics no auth status = %d body=%s", resp.StatusCode, body)
+	}
+	resp, body = get(t, proxy, "/metrics", "secret")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics with token status = %d body=%s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte("bursty_requests_total")) {
+		t.Fatalf("metrics body = %s", body)
+	}
+}
+
+func TestUIServedGateAndOdometer(t *testing.T) {
+	local, _ := fakeLocal(t)
+	proxy := newProxyWithHandlers(t, config.Config{
+		BurstOnError: true,
+		Token:        "secret",
+	}, local, nil)
+
+	resp, body := get(t, proxy, "/ui", "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("ui no auth status = %d body=%s", resp.StatusCode, body)
+	}
+	resp, body = get(t, proxy, "/ui", "secret")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ui with token status = %d body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if !bytes.Contains(body, []byte(`id="savings-odometer"`)) {
+		t.Fatalf("ui missing savings odometer id")
+	}
+	if len(body) >= 15*1024 {
+		t.Fatalf("ui.html is %d bytes, want < 15KB", len(body))
+	}
+}
+
+func TestRecentRingBoundedAndPopulated(t *testing.T) {
+	local, _ := fakeLocal(t)
+	proxy := newProxyWithHandlers(t, config.Config{BurstOnError: true}, local, nil)
+
+	for i := 0; i < recentDecisionCap+5; i++ {
+		resp, body := postChat(t, proxy, `{"model":"llama3","messages":[]}`, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("chat %d status = %d body=%s", i, resp.StatusCode, body)
+		}
+	}
+
+	resp, body := get(t, proxy, "/stats", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stats status = %d body=%s", resp.StatusCode, body)
+	}
+	var payload struct {
+		Recent []recentDecision `json:"recent"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("stats JSON: %v\n%s", err, body)
+	}
+	if len(payload.Recent) != recentDecisionCap {
+		t.Fatalf("recent length = %d, want %d", len(payload.Recent), recentDecisionCap)
+	}
+	first := payload.Recent[0]
+	if first.Path != chatCompletionsPath || first.Route != "local" || first.Reason != "policy" || first.Status != http.StatusOK {
+		t.Fatalf("recent[0] = %#v", first)
+	}
+	if first.At == "" {
+		t.Fatalf("recent[0] missing timestamp: %#v", first)
+	}
+}
+
 func TestSavingsPricingPrecedence(t *testing.T) {
 	t.Parallel()
 
@@ -2733,6 +2870,67 @@ func writeTestJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func parsePromMetrics(t *testing.T, body []byte) map[string]string {
+	t.Helper()
+	metrics := map[string]string{}
+	helpSeen := map[string]bool{}
+	typeSeen := map[string]bool{}
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "# HELP ") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				t.Fatalf("bad HELP line %q", line)
+			}
+			helpSeen[fields[2]] = true
+			continue
+		}
+		if strings.HasPrefix(line, "# TYPE ") {
+			fields := strings.Fields(line)
+			if len(fields) != 4 {
+				t.Fatalf("bad TYPE line %q", line)
+			}
+			typeSeen[fields[2]] = true
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			t.Fatalf("bad comment line %q", line)
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("bad metric line %q", line)
+		}
+		if _, err := strconv.ParseFloat(fields[1], 64); err != nil {
+			t.Fatalf("bad metric value in %q: %v", line, err)
+		}
+		metrics[fields[0]] = fields[1]
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan metrics: %v", err)
+	}
+	for name := range metrics {
+		base := strings.Split(name, "{")[0]
+		if !helpSeen[base] {
+			t.Fatalf("metric %q missing HELP", name)
+		}
+		if !typeSeen[base] {
+			t.Fatalf("metric %q missing TYPE", name)
+		}
+	}
+	return metrics
+}
+
+func assertPromMetric(t *testing.T, metrics map[string]string, name, want string) {
+	t.Helper()
+	if got, ok := metrics[name]; !ok || got != want {
+		t.Fatalf("metric %s = %q present=%v, want %q; metrics=%#v", name, got, ok, want, metrics)
+	}
 }
 
 func readSSEEvent(t *testing.T, reader *bufio.Reader) string {
