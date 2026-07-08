@@ -168,6 +168,18 @@ func TestParseAliases(t *testing.T) {
 			},
 		},
 		{
+			name: "mixed-case key lowercased, target case preserved",
+			env:  map[string]string{envLocalURL: "http://local"},
+			args: []string{"-alias", "Claude-Haiku-4.5=Qwen2.5-Coder:7b"},
+			want: map[string]string{"claude-haiku-4.5": "Qwen2.5-Coder:7b"},
+		},
+		{
+			name:    "duplicate key differing only in case",
+			env:     map[string]string{envLocalURL: "http://local"},
+			args:    []string{"-alias", "GPT-4o=llama3", "-alias", "gpt-4o=qwen"},
+			wantErr: "duplicate alias",
+		},
+		{
 			name:    "invalid shape",
 			env:     map[string]string{envLocalURL: "http://local"},
 			args:    []string{"-alias", "gpt-4o"},

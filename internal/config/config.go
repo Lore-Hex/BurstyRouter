@@ -326,7 +326,7 @@ func parseAliasPair(value string) (string, string, error) {
 		return "", "", fmt.Errorf("alias %q must have from=to shape", value)
 	}
 	from, to, _ := strings.Cut(value, "=")
-	from = strings.TrimSpace(from)
+	from = strings.ToLower(strings.TrimSpace(from))
 	to = strings.TrimSpace(to)
 	if from == "" || to == "" {
 		return "", "", fmt.Errorf("alias %q must have non-empty from and to", value)

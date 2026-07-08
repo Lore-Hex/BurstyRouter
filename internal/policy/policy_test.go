@@ -217,6 +217,132 @@ func TestDecideAliases(t *testing.T) {
 	})
 }
 
+func TestDecideNormalizationEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		raw       []byte
+		route     Route
+		reason    Reason
+		localBody []byte
+	}{
+		{
+			name:      "provider only mixed-case Local",
+			raw:       []byte(`{"model":"x","provider":{"only":["Local"]},"messages":[]}`),
+			route:     RouteLocal,
+			reason:    ReasonForced,
+			localBody: []byte(`{"model":"x","messages":[]}`),
+		},
+		{
+			name:      "provider only padded local",
+			raw:       []byte(`{"model":"x","provider":{"only":[" local "]},"messages":[]}`),
+			route:     RouteLocal,
+			reason:    ReasonForced,
+			localBody: []byte(`{"model":"x","messages":[]}`),
+		},
+		{
+			name:      "provider only comma-string local",
+			raw:       []byte(`{"model":"x","provider":{"only":"local"},"messages":[]}`),
+			route:     RouteLocal,
+			reason:    ReasonForced,
+			localBody: []byte(`{"model":"x","messages":[]}`),
+		},
+		{
+			name:   "provider order comma-string names external",
+			raw:    []byte(`{"model":"trustedrouter/auto","provider":{"order":"local,anthropic"},"messages":[]}`),
+			route:  RouteTrustedRouter,
+			reason: ReasonForced,
+		},
+		{
+			name:      "bare-string provider local",
+			raw:       []byte(`{"model":"x","provider":"local","messages":[]}`),
+			route:     RouteLocal,
+			reason:    ReasonForced,
+			localBody: []byte(`{"model":"x","messages":[]}`),
+		},
+		{
+			name:   "bare-string provider external",
+			raw:    []byte(`{"model":"x","provider":"anthropic","messages":[]}`),
+			route:  RouteTrustedRouter,
+			reason: ReasonForced,
+		},
+		{
+			name:      "local prefix mixed-case strips and preserves suffix",
+			raw:       []byte(`{"model":"Local/Llama3","messages":[]}`),
+			route:     RouteLocal,
+			reason:    ReasonForced,
+			localBody: []byte(`{"model":"Llama3","messages":[]}`),
+		},
+		{
+			name:      "local prefix padded strips and preserves suffix",
+			raw:       []byte(`{"model":" local/Llama3 ","messages":[]}`),
+			route:     RouteLocal,
+			reason:    ReasonForced,
+			localBody: []byte(`{"model":"Llama3","messages":[]}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Decide(tt.raw, true, true)
+			if err != nil {
+				t.Fatalf("Decide() error = %v", err)
+			}
+			if got.Route != tt.route || got.Reason != tt.reason {
+				t.Fatalf("route/reason = %s/%s, want %s/%s", got.Route, got.Reason, tt.route, tt.reason)
+			}
+			if !bytes.Equal(got.TRBody, tt.raw) {
+				t.Fatalf("TRBody = %s, want verbatim %s", got.TRBody, tt.raw)
+			}
+			if tt.localBody == nil {
+				return
+			}
+			assertJSONEqual(t, got.LocalBody, tt.localBody)
+		})
+	}
+}
+
+func TestDecideRejectsEmptyLocalPrefix(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range [][]byte{
+		[]byte(`{"model":"local/","messages":[]}`),
+		[]byte(`{"model":"local/  ","messages":[]}`),
+		[]byte(`{"model":" LOCAL/ ","messages":[]}`),
+	} {
+		_, err := Decide(raw, true, true)
+		var configErr *ConfigError
+		if !errors.As(err, &configErr) {
+			t.Fatalf("Decide(%s) error = %v, want ConfigError", raw, err)
+		}
+		if configErr.Code != "invalid_local_model" {
+			t.Fatalf("ConfigError code = %q, want invalid_local_model", configErr.Code)
+		}
+	}
+}
+
+func TestDecideAliasLookupCaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	// Alias keys are stored lowercased by config parsing; a mixed-case request
+	// model must still resolve to the local target instead of bursting to cloud.
+	aliases := map[string]string{"claude-haiku-4.5": "qwen2.5-coder:7b"}
+	raw := []byte(`{"model":"Claude-Haiku-4.5","messages":[]}`)
+	got, err := Decide(raw, true, true, Options{Aliases: aliases})
+	if err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	if got.Route != RouteLocal || got.Reason != ReasonPolicy {
+		t.Fatalf("route/reason = %s/%s, want local/policy", got.Route, got.Reason)
+	}
+	assertJSONEqual(t, got.LocalBody, []byte(`{"model":"qwen2.5-coder:7b","messages":[]}`))
+	if !got.BurstAllowed {
+		t.Fatalf("BurstAllowed = false, want true for an aliased request")
+	}
+}
+
 func TestDecideInjectsStreamUsageOnlyIntoLocalBody(t *testing.T) {
 	t.Parallel()
 

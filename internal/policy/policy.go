@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -27,8 +28,88 @@ const (
 
 // ProviderDirective is the minimal provider routing shape BurstyRouter needs.
 type ProviderDirective struct {
-	Only  []string `json:"only"`
-	Order []string `json:"order"`
+	Only  stringList `json:"only"`
+	Order stringList `json:"order"`
+}
+
+// UnmarshalJSON tolerates a bare-string provider (e.g. "provider":"local") by
+// treating it as a single-entry restriction, so those requests route instead
+// of failing to decode. Objects decode normally.
+func (p *ProviderDirective) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var single string
+		if err := json.Unmarshal(trimmed, &single); err != nil {
+			return err
+		}
+		if value := strings.TrimSpace(single); value != "" {
+			p.Only = stringList{value}
+		}
+		return nil
+	}
+	type alias ProviderDirective
+	var tmp alias
+	if err := json.Unmarshal(trimmed, &tmp); err != nil {
+		return err
+	}
+	*p = ProviderDirective(tmp)
+	return nil
+}
+
+// stringList decodes from either a JSON array of strings or a single
+// comma-separated string (OpenRouter's comma form), mirroring the enclave's
+// lenient provider-list handling so both shapes route the same way.
+type stringList []string
+
+func (s *stringList) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*s = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var arr []string
+		if err := json.Unmarshal(trimmed, &arr); err != nil {
+			return err
+		}
+		*s = arr
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(trimmed, &single); err != nil {
+		return err
+	}
+	parts := strings.Split(single, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			out = append(out, value)
+		}
+	}
+	*s = out
+	return nil
+}
+
+// localEntry reports whether a provider entry names the local upstream,
+// tolerant of case and surrounding whitespace.
+func localEntry(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), "local")
+}
+
+// localModelTarget reports whether a model id is pinned to local via the
+// "local/" prefix (case-insensitive, whitespace-tolerant) and returns the
+// downstream model name with the prefix stripped. The suffix case is preserved
+// because local model ids are case-sensitive.
+func localModelTarget(model string) (string, bool) {
+	trimmed := strings.TrimSpace(model)
+	const prefix = "local/"
+	if len(trimmed) < len(prefix) || !strings.EqualFold(trimmed[:len(prefix)], prefix) {
+		return "", false
+	}
+	return trimmed[len(prefix):], true
 }
 
 // RequestView is a minimal decoded view of a chat request. Raw forwarding
@@ -150,7 +231,7 @@ func Decide(raw []byte, hasLocal, hasTrustedRouter bool, options ...Options) (De
 	if isLocalOnly(view.Provider) {
 		return local(ReasonForced)
 	}
-	if strings.HasPrefix(view.Model, "local/") {
+	if _, ok := localModelTarget(view.Model); ok {
 		return local(ReasonForced)
 	}
 	return local(ReasonPolicy)
@@ -198,8 +279,16 @@ func localForwardBody(raw []byte, view RequestView, aliasTarget string) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasPrefix(view.Model, "local/") {
-		body, err = ReplaceTopLevelString(body, "model", strings.TrimPrefix(view.Model, "local/"))
+	if target, ok := localModelTarget(view.Model); ok {
+		if strings.TrimSpace(target) == "" {
+			return nil, &ConfigError{
+				Route:   RouteLocal,
+				Code:    "invalid_local_model",
+				Message: `model "local/" requires a model name after the prefix`,
+				Type:    "invalid_request_error",
+			}
+		}
+		body, err = ReplaceTopLevelString(body, "model", target)
 		if err != nil {
 			return nil, err
 		}
@@ -231,10 +320,10 @@ func firstOptions(options []Options) Options {
 }
 
 func aliasFor(view RequestView, aliases map[string]string) (string, bool) {
-	if strings.HasPrefix(view.Model, "local/") || len(aliases) == 0 {
+	if _, isLocal := localModelTarget(view.Model); isLocal || len(aliases) == 0 {
 		return "", false
 	}
-	target, ok := aliases[view.Model]
+	target, ok := aliases[strings.ToLower(strings.TrimSpace(view.Model))]
 	return target, ok
 }
 
@@ -258,10 +347,11 @@ func applyBurstPolicy(decision *Decision, raw []byte, view RequestView, aliased 
 }
 
 func cloudRoutableModel(model string) bool {
-	if strings.HasPrefix(model, "local/") {
+	if _, ok := localModelTarget(model); ok {
 		return false
 	}
-	return strings.Contains(model, "/") || strings.HasPrefix(model, "trustedrouter/")
+	trimmed := strings.TrimSpace(model)
+	return strings.Contains(trimmed, "/") || strings.HasPrefix(strings.ToLower(trimmed), "trustedrouter/")
 }
 
 func isLocalOnly(provider *ProviderDirective) bool {
@@ -269,7 +359,7 @@ func isLocalOnly(provider *ProviderDirective) bool {
 		return false
 	}
 	for _, value := range provider.Only {
-		if value != "local" {
+		if !localEntry(value) {
 			return false
 		}
 	}
@@ -277,7 +367,11 @@ func isLocalOnly(provider *ProviderDirective) bool {
 }
 
 func localPinned(view RequestView) bool {
-	return isLocalOnly(view.Provider) || strings.HasPrefix(view.Model, "local/")
+	if isLocalOnly(view.Provider) {
+		return true
+	}
+	_, ok := localModelTarget(view.Model)
+	return ok
 }
 
 func mentionsNonLocal(provider *ProviderDirective) bool {
@@ -291,7 +385,11 @@ func requiredNonLocalProviders(provider *ProviderDirective) []string {
 	var out []string
 	seen := map[string]struct{}{}
 	add := func(value string) {
-		if value == "local" {
+		if localEntry(value) {
+			return
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
 			return
 		}
 		if _, ok := seen[value]; ok {
