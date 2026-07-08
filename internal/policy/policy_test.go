@@ -385,6 +385,25 @@ func TestDecideFoldsMaxTokensAliasesIntoLocalBody(t *testing.T) {
 	}
 }
 
+func TestDecideRejectsNonCanonicalTopLevelKeys(t *testing.T) {
+	t.Parallel()
+
+	// encoding/json matches fields case-insensitively; the raw splice is
+	// exact-case. A non-canonical spelling of a key Bursty reads/rewrites would
+	// let the routing decision and the body rewrite disagree, so it is rejected.
+	for _, raw := range [][]byte{
+		[]byte(`{"model":"openai/gpt-4o","Model":"local/qwen","messages":[]}`),
+		[]byte(`{"Model":"local/qwen","messages":[]}`),
+		[]byte(`{"model":"llama3","Stream":true,"messages":[]}`),
+		[]byte(`{"model":"llama3","Max_Tokens":10,"messages":[]}`),
+	} {
+		_, err := Decide(raw, true, true)
+		if err == nil || !strings.Contains(err.Error(), "non-canonical top-level key") {
+			t.Fatalf("Decide(%s) error = %v, want non-canonical top-level key", raw, err)
+		}
+	}
+}
+
 func TestDecideRejectsEmptyLocalPrefix(t *testing.T) {
 	t.Parallel()
 

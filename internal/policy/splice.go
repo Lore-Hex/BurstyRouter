@@ -5,7 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
+
+// isRewrittenKey reports whether key (already lowercased) is a top-level key
+// BurstyRouter reads for routing or rewrites in the forwarded body, and so must
+// appear at most once in canonical lowercase form.
+func isRewrittenKey(key string) bool {
+	switch key {
+	case "model", "provider", "max_tokens", "max_completion_tokens", "max_output_tokens", "stream", "stream_options":
+		return true
+	default:
+		return false
+	}
+}
 
 type objectMember struct {
 	key         string
@@ -164,16 +177,21 @@ func scanTopLevelObject(raw []byte) (objectScan, error) {
 		if err := json.Unmarshal(raw[i:keyEnd], &key); err != nil {
 			return objectScan{}, err
 		}
-		// Reject duplicate occurrences of the top-level keys BurstyRouter reads or
-		// rewrites. A duplicate is ambiguous (JSON decoders take the last, our raw
-		// splicing would take the first), so folding/rewriting could corrupt the
-		// forwarded request. Malformed input is refused rather than mishandled.
-		switch key {
-		case "model", "provider", "max_tokens", "max_completion_tokens", "max_output_tokens", "stream", "stream_options":
-			if _, ok := seenUniqueKeys[key]; ok {
+		// For the top-level keys BurstyRouter reads or rewrites, require exactly one
+		// occurrence in canonical lowercase form. encoding/json matches struct
+		// fields case-insensitively and takes the last duplicate, whereas our raw
+		// splicing is exact-case and takes the first — so a non-canonical-case or
+		// duplicate key would let the routing decision and the body rewrite
+		// disagree and corrupt the forwarded request. Such malformed input is
+		// refused rather than mishandled.
+		if lower := strings.ToLower(key); isRewrittenKey(lower) {
+			if key != lower {
+				return objectScan{}, fmt.Errorf("non-canonical top-level key %q (use %q)", key, lower)
+			}
+			if _, ok := seenUniqueKeys[lower]; ok {
 				return objectScan{}, fmt.Errorf("duplicate top-level key %q", key)
 			}
-			seenUniqueKeys[key] = struct{}{}
+			seenUniqueKeys[lower] = struct{}{}
 		}
 		i = skipWhitespace(raw, keyEnd)
 		if i >= len(raw) || raw[i] != ':' {
