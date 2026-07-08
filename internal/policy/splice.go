@@ -138,7 +138,7 @@ func scanTopLevelObject(raw []byte) (objectScan, error) {
 	}
 	i++
 	var members []objectMember
-	seenRoutingKeys := map[string]struct{}{}
+	seenUniqueKeys := map[string]struct{}{}
 	for {
 		i = skipWhitespace(raw, i)
 		if i >= len(raw) {
@@ -164,11 +164,16 @@ func scanTopLevelObject(raw []byte) (objectScan, error) {
 		if err := json.Unmarshal(raw[i:keyEnd], &key); err != nil {
 			return objectScan{}, err
 		}
-		if key == "model" || key == "provider" {
-			if _, ok := seenRoutingKeys[key]; ok {
+		// Reject duplicate occurrences of the top-level keys BurstyRouter reads or
+		// rewrites. A duplicate is ambiguous (JSON decoders take the last, our raw
+		// splicing would take the first), so folding/rewriting could corrupt the
+		// forwarded request. Malformed input is refused rather than mishandled.
+		switch key {
+		case "model", "provider", "max_tokens", "max_completion_tokens", "max_output_tokens":
+			if _, ok := seenUniqueKeys[key]; ok {
 				return objectScan{}, fmt.Errorf("duplicate top-level key %q", key)
 			}
-			seenRoutingKeys[key] = struct{}{}
+			seenUniqueKeys[key] = struct{}{}
 		}
 		i = skipWhitespace(raw, keyEnd)
 		if i >= len(raw) || raw[i] != ':' {

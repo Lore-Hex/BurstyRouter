@@ -99,6 +99,10 @@ func TestReasoningEffortFromThinking(t *testing.T) {
 		{`{"type":"enabled","budget_tokens":2048}`, "medium"},
 		{`{"type":"enabled","budget_tokens":4096}`, "medium"},
 		{`{"type":"enabled","budget_tokens":16000}`, "high"},
+		{`{"type":"enabled","budget_tokens":99999999999999999999}`, "high"},
+		{`{"type":"enabled","budget_tokens":2048.5}`, "medium"},
+		{`{"type":"enabled","budget_tokens":"oops"}`, "medium"},
+		{`{"budget_tokens":"oops"}`, ""},
 		{`{"type":"enabled"}`, "medium"},
 		{`{"budget_tokens":900}`, "low"},
 	}

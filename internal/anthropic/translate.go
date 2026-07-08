@@ -434,9 +434,11 @@ func reasoningEffortFromThinking(raw json.RawMessage) string {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return ""
 	}
+	// Capture budget_tokens as raw so a malformed value (string, etc.) does not
+	// fail the whole decode and lose the type directive.
 	var cfg struct {
-		Type         string       `json:"type"`
-		BudgetTokens *json.Number `json:"budget_tokens"`
+		Type         string          `json:"type"`
+		BudgetTokens json.RawMessage `json:"budget_tokens"`
 	}
 	if err := decodeUseNumber(raw, &cfg); err != nil {
 		return ""
@@ -444,25 +446,26 @@ func reasoningEffortFromThinking(raw json.RawMessage) string {
 	if cfg.Type != "" && !strings.EqualFold(cfg.Type, "enabled") {
 		return ""
 	}
-	budget := 0
-	if cfg.BudgetTokens != nil {
-		if n, err := cfg.BudgetTokens.Int64(); err == nil {
-			budget = int(n)
+	// Parse as float so a huge or overflowing budget still buckets as "high"
+	// rather than falling through to the enabled-default.
+	if len(bytes.TrimSpace(cfg.BudgetTokens)) > 0 {
+		var budget float64
+		if err := json.Unmarshal(cfg.BudgetTokens, &budget); err == nil && budget > 0 {
+			switch {
+			case budget <= 1024:
+				return "low"
+			case budget <= 4096:
+				return "medium"
+			default:
+				return "high"
+			}
 		}
 	}
-	switch {
-	case budget <= 0:
-		if strings.EqualFold(cfg.Type, "enabled") {
-			return "medium"
-		}
-		return ""
-	case budget <= 1024:
-		return "low"
-	case budget <= 4096:
+	// Enabled with no usable budget → neutral default; otherwise no hint.
+	if strings.EqualFold(cfg.Type, "enabled") {
 		return "medium"
-	default:
-		return "high"
 	}
+	return ""
 }
 
 func translateToolChoice(raw json.RawMessage) (any, error) {
