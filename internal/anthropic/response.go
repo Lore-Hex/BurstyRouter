@@ -20,8 +20,20 @@ type openAIChoice struct {
 }
 
 type openAIChoiceMessage struct {
-	Content   json.RawMessage          `json:"content"`
-	ToolCalls []openAIResponseToolCall `json:"tool_calls"`
+	Content          json.RawMessage          `json:"content"`
+	ReasoningContent string                   `json:"reasoning_content"`
+	Reasoning        string                   `json:"reasoning"`
+	ToolCalls        []openAIResponseToolCall `json:"tool_calls"`
+}
+
+// reasoningText returns the chain-of-thought a reasoning model attached to a
+// non-streaming response, preferring the reasoning_content spelling used by
+// DeepSeek/Kimi over the plain reasoning field.
+func (m openAIChoiceMessage) reasoningText() string {
+	if m.ReasoningContent != "" {
+		return m.ReasoningContent
+	}
+	return m.Reasoning
 }
 
 type openAIResponseToolCall struct {
@@ -76,16 +88,18 @@ type messageResponse struct {
 }
 
 type responseUsage struct {
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
+	InputTokens          int64 `json:"input_tokens"`
+	OutputTokens         int64 `json:"output_tokens"`
+	CacheReadInputTokens int64 `json:"cache_read_input_tokens,omitempty"`
 }
 
 type responseBlock struct {
-	Type  string `json:"type"`
-	Text  string `json:"text,omitempty"`
-	ID    string `json:"id,omitempty"`
-	Name  string `json:"name,omitempty"`
-	Input any    `json:"input,omitempty"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Input    any    `json:"input,omitempty"`
 }
 
 // TranslateResponse converts a non-streaming OpenAI chat completion response
@@ -100,7 +114,10 @@ func TranslateResponse(raw []byte, visibleModel string) ([]byte, Usage, error) {
 		choice = in.Choices[0]
 	}
 
-	blocks := make([]responseBlock, 0, 1+len(choice.Message.ToolCalls))
+	blocks := make([]responseBlock, 0, 2+len(choice.Message.ToolCalls))
+	if reasoning := choice.Message.reasoningText(); reasoning != "" {
+		blocks = append(blocks, responseBlock{Type: "thinking", Thinking: reasoning})
+	}
 	if text := responseContentText(choice.Message.Content); text != "" {
 		blocks = append(blocks, responseBlock{Type: "text", Text: text})
 	}
@@ -138,8 +155,9 @@ func TranslateResponse(raw []byte, visibleModel string) ([]byte, Usage, error) {
 		Content:    blocks,
 		StopReason: stopReason,
 		Usage: responseUsage{
-			InputTokens:  usage.PromptTokens,
-			OutputTokens: usage.CompletionTokens,
+			InputTokens:          usage.PromptTokens,
+			OutputTokens:         usage.CompletionTokens,
+			CacheReadInputTokens: usage.CachedTokens,
 		},
 	}
 	body, err := json.Marshal(out)

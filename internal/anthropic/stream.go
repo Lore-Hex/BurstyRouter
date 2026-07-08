@@ -93,7 +93,10 @@ func TranslateStream(r io.Reader, w io.Writer, visibleModel string) (Usage, erro
 			_ = writeStreamError(w, fmt.Sprintf("malformed OpenAI stream chunk: %v", err))
 			return finalUsage, err
 		}
-		if chunk.Usage != nil {
+		// Latch usage only from a chunk that carries real counts. Some providers
+		// send a spec-compliant trailing chunk with usage:{0,0}, which would
+		// otherwise clobber the true totals from the last content chunk.
+		if chunk.Usage != nil && (chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0) {
 			finalUsage = Usage{
 				PromptTokens:     chunk.Usage.PromptTokens,
 				CompletionTokens: chunk.Usage.CompletionTokens,

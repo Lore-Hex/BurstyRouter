@@ -141,6 +141,65 @@ func TestTranslateContentFilterMapsToRefusal(t *testing.T) {
 	})
 }
 
+func TestTranslateResponseSurfacesReasoningAndCacheTokens(t *testing.T) {
+	raw := []byte(`{
+		"model":"m",
+		"choices":[{"message":{"reasoning_content":"let me think","content":"answer"},"finish_reason":"stop"}],
+		"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":4}}
+	}`)
+	got, usage, err := TranslateResponse(raw, "visible")
+	if err != nil {
+		t.Fatalf("TranslateResponse() error = %v", err)
+	}
+	if usage.CachedTokens != 4 {
+		t.Fatalf("Usage.CachedTokens = %d, want 4", usage.CachedTokens)
+	}
+	var out struct {
+		Content []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens          int64 `json:"input_tokens"`
+			OutputTokens         int64 `json:"output_tokens"`
+			CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, got)
+	}
+	if len(out.Content) != 2 {
+		t.Fatalf("content blocks = %d, want 2 (thinking, text)\n%s", len(out.Content), got)
+	}
+	if out.Content[0].Type != "thinking" || out.Content[0].Thinking != "let me think" {
+		t.Fatalf("block[0] = %+v, want thinking 'let me think'", out.Content[0])
+	}
+	if out.Content[1].Type != "text" || out.Content[1].Text != "answer" {
+		t.Fatalf("block[1] = %+v, want text 'answer'", out.Content[1])
+	}
+	if out.Usage.CacheReadInputTokens != 4 {
+		t.Fatalf("usage.cache_read_input_tokens = %d, want 4", out.Usage.CacheReadInputTokens)
+	}
+}
+
+func TestTranslateStreamIgnoresTrailingZeroUsage(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"hi"}}],"usage":{"prompt_tokens":8,"completion_tokens":3}}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+	var out bytes.Buffer
+	usage, err := TranslateStream(strings.NewReader(input), &out, "visible")
+	if err != nil {
+		t.Fatalf("TranslateStream() error = %v\n%s", err, out.String())
+	}
+	if usage.PromptTokens != 8 || usage.CompletionTokens != 3 {
+		t.Fatalf("usage = %+v, want prompt 8 completion 3", usage)
+	}
+}
+
 func TestTranslateRequestToolChoiceAndArguments(t *testing.T) {
 	tests := []struct {
 		name          string
