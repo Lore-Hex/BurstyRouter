@@ -385,6 +385,32 @@ func TestDecideFoldsMaxTokensAliasesIntoLocalBody(t *testing.T) {
 	}
 }
 
+func TestDecideDoesNotCorruptDuplicateMaxTokens(t *testing.T) {
+	t.Parallel()
+
+	// Malformed body with duplicate max_tokens keys where a later one is a real
+	// value: the explicit non-null cap must win and no folded max_tokens may be
+	// appended (last-key-wins parsers would otherwise pick the wrong cap).
+	raw := []byte(`{"model":"local/qwen","max_tokens":null,"max_completion_tokens":256,"max_tokens":999,"messages":[]}`)
+	got, err := Decide(raw, true, true)
+	if err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	if n := bytes.Count(got.LocalBody, []byte(`"max_tokens"`)); n != 2 {
+		t.Fatalf("LocalBody has %d max_tokens keys, want 2 (unchanged)\n%s", n, got.LocalBody)
+	}
+	if bytes.Contains(got.LocalBody, []byte(`"max_tokens":256`)) {
+		t.Fatalf("folded alias corrupted the body with max_tokens:256\n%s", got.LocalBody)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(got.LocalBody, &m); err != nil {
+		t.Fatalf("LocalBody is invalid JSON: %v\n%s", err, got.LocalBody)
+	}
+	if got, ok := m["max_tokens"].(float64); !ok || got != 999 {
+		t.Fatalf("last-wins max_tokens = %v, want 999", m["max_tokens"])
+	}
+}
+
 func TestDecideRejectsEmptyLocalPrefix(t *testing.T) {
 	t.Parallel()
 

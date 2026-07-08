@@ -319,12 +319,17 @@ func localForwardBody(raw []byte, view RequestView, aliasTarget string) ([]byte,
 // positive-integer alias value (rejecting floats, exponents, zero, and
 // overflow so a strict local server never sees a malformed max_tokens).
 func normalizeMaxTokens(raw []byte) ([]byte, error) {
-	value, ok, err := topLevelRawValue(raw, "max_tokens")
+	scan, err := scanTopLevelObject(raw)
 	if err != nil {
 		return nil, err
 	}
-	if ok && !isJSONNull(value) {
-		return raw, nil
+	// If ANY top-level max_tokens carries a non-null value, it wins verbatim.
+	// Scanning every occurrence (not just the first) keeps a malformed body with
+	// duplicate max_tokens keys from being folded into a wrong, corrupted cap.
+	for _, member := range scan.members {
+		if member.key == "max_tokens" && !isJSONNull(raw[member.valueStart:member.valueEnd]) {
+			return raw, nil
+		}
 	}
 	for _, key := range []string{"max_completion_tokens", "max_output_tokens"} {
 		aliasValue, present, err := topLevelRawValue(raw, key)
@@ -338,9 +343,30 @@ func normalizeMaxTokens(raw []byte) ([]byte, error) {
 		if !valid {
 			continue
 		}
-		return InjectTopLevelObject(raw, "max_tokens", []byte(strconv.FormatInt(n, 10)))
+		// Strip every existing (null) max_tokens before injecting so a duplicate
+		// key cannot survive alongside the folded value.
+		body, err := removeAllTopLevelKeys(raw, "max_tokens")
+		if err != nil {
+			return nil, err
+		}
+		return InjectTopLevelObject(body, "max_tokens", []byte(strconv.FormatInt(n, 10)))
 	}
 	return raw, nil
+}
+
+// removeAllTopLevelKeys strips every top-level member with the given key.
+func removeAllTopLevelKeys(raw []byte, key string) ([]byte, error) {
+	body := raw
+	for {
+		stripped, err := RemoveTopLevelKey(body, key)
+		if err != nil {
+			return nil, err
+		}
+		if bytes.Equal(stripped, body) {
+			return body, nil
+		}
+		body = stripped
+	}
 }
 
 func isJSONNull(value []byte) bool {

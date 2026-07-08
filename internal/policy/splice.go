@@ -82,8 +82,9 @@ func ReplaceTopLevelString(raw []byte, key, value string) ([]byte, error) {
 	return nil, fmt.Errorf("top-level key %q not found", key)
 }
 
-// InjectTopLevelObject inserts or replaces a top-level object member with an
-// already-encoded JSON object value.
+// InjectTopLevelObject inserts or replaces a top-level member with an
+// already-encoded JSON value (an object, or any valid scalar such as a number).
+// Any existing member with the same key is removed first.
 func InjectTopLevelObject(raw []byte, key string, objectValue []byte) ([]byte, error) {
 	if !json.Valid(objectValue) {
 		return nil, errors.New("injected value is not valid JSON")
