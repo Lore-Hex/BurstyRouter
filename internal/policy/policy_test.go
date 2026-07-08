@@ -553,6 +553,8 @@ func TestDecideRejectsDuplicateTopLevelKeys(t *testing.T) {
 		[]byte(`{"model":"local/qwen","max_tokens":null,"max_completion_tokens":256,"max_tokens":999,"messages":[]}`),
 		[]byte(`{"model":"local/qwen","max_completion_tokens":128,"max_completion_tokens":256,"messages":[]}`),
 		[]byte(`{"model":"local/qwen","max_output_tokens":128,"max_output_tokens":256,"messages":[]}`),
+		[]byte(`{"model":"llama3","stream":false,"stream":true,"messages":[]}`),
+		[]byte(`{"model":"llama3","stream":true,"stream_options":{"include_usage":false},"stream_options":{"include_usage":true},"messages":[]}`),
 	} {
 		_, err := Decide(raw, true, true)
 		if err == nil || !strings.Contains(err.Error(), "duplicate top-level key") {

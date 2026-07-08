@@ -169,7 +169,7 @@ func scanTopLevelObject(raw []byte) (objectScan, error) {
 		// splicing would take the first), so folding/rewriting could corrupt the
 		// forwarded request. Malformed input is refused rather than mishandled.
 		switch key {
-		case "model", "provider", "max_tokens", "max_completion_tokens", "max_output_tokens":
+		case "model", "provider", "max_tokens", "max_completion_tokens", "max_output_tokens", "stream", "stream_options":
 			if _, ok := seenUniqueKeys[key]; ok {
 				return objectScan{}, fmt.Errorf("duplicate top-level key %q", key)
 			}

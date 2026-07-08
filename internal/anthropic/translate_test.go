@@ -187,6 +187,28 @@ func TestTranslateResponseSurfacesReasoningAndCacheTokens(t *testing.T) {
 	}
 }
 
+func TestTranslateResponseToleratesNonStringReasoning(t *testing.T) {
+	// A provider that returns reasoning as an object (not a string) must not
+	// fail the decode; the text is translated and no thinking block is emitted.
+	raw := []byte(`{"model":"m","choices":[{"message":{"content":"ok","reasoning":{"effort":"high"}},"finish_reason":"stop"}]}`)
+	got, _, err := TranslateResponse(raw, "visible")
+	if err != nil {
+		t.Fatalf("TranslateResponse() error = %v", err)
+	}
+	var out struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, got)
+	}
+	if len(out.Content) != 1 || out.Content[0].Type != "text" || out.Content[0].Text != "ok" {
+		t.Fatalf("content = %+v, want a single text block \"ok\" and no thinking", out.Content)
+	}
+}
+
 func TestTranslateStreamIgnoresTrailingZeroUsage(t *testing.T) {
 	input := strings.Join([]string{
 		`data: {"choices":[{"delta":{"content":"hi"}}],"usage":{"prompt_tokens":8,"completion_tokens":3}}`,

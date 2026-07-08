@@ -21,19 +21,21 @@ type openAIChoice struct {
 
 type openAIChoiceMessage struct {
 	Content          json.RawMessage          `json:"content"`
-	ReasoningContent string                   `json:"reasoning_content"`
-	Reasoning        string                   `json:"reasoning"`
+	ReasoningContent json.RawMessage          `json:"reasoning_content"`
+	Reasoning        json.RawMessage          `json:"reasoning"`
 	ToolCalls        []openAIResponseToolCall `json:"tool_calls"`
 }
 
 // reasoningText returns the chain-of-thought a reasoning model attached to a
 // non-streaming response, preferring the reasoning_content spelling used by
-// DeepSeek/Kimi over the plain reasoning field.
+// DeepSeek/Kimi over the plain reasoning field. The fields are decoded as raw
+// JSON and only surfaced when they are strings, so a non-string shape (e.g.
+// OpenAI's reasoning object) is ignored rather than failing the whole decode.
 func (m openAIChoiceMessage) reasoningText() string {
-	if m.ReasoningContent != "" {
-		return m.ReasoningContent
+	if s := rawString(m.ReasoningContent); s != "" {
+		return s
 	}
-	return m.Reasoning
+	return rawString(m.Reasoning)
 }
 
 type openAIResponseToolCall struct {
