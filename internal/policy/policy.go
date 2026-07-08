@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -313,25 +314,56 @@ func localForwardBody(raw []byte, view RequestView, aliasTarget string) ([]byte,
 
 // normalizeMaxTokens folds OpenAI's max_completion_tokens / max_output_tokens
 // spellings into a top-level max_tokens for local servers that only read
-// max_tokens, mirroring the enclave. An explicit max_tokens always wins, and
-// only a positive-integer alias value is folded.
+// max_tokens, mirroring the enclave. An explicit non-null max_tokens always
+// wins; the fold only fires when max_tokens is absent or null, and only for a
+// positive-integer alias value (rejecting floats, exponents, zero, and
+// overflow so a strict local server never sees a malformed max_tokens).
 func normalizeMaxTokens(raw []byte) ([]byte, error) {
-	if _, ok, err := topLevelRawValue(raw, "max_tokens"); err != nil {
+	value, ok, err := topLevelRawValue(raw, "max_tokens")
+	if err != nil {
 		return nil, err
-	} else if ok {
+	}
+	if ok && !isJSONNull(value) {
 		return raw, nil
 	}
 	for _, key := range []string{"max_completion_tokens", "max_output_tokens"} {
-		value, ok, err := topLevelRawValue(raw, key)
+		aliasValue, present, err := topLevelRawValue(raw, key)
 		if err != nil {
 			return nil, err
 		}
-		if !ok || len(value) == 0 || value[0] < '0' || value[0] > '9' {
+		if !present {
 			continue
 		}
-		return InjectTopLevelObject(raw, "max_tokens", value)
+		n, valid := positiveIntToken(aliasValue)
+		if !valid {
+			continue
+		}
+		return InjectTopLevelObject(raw, "max_tokens", []byte(strconv.FormatInt(n, 10)))
 	}
 	return raw, nil
+}
+
+func isJSONNull(value []byte) bool {
+	return bytes.Equal(bytes.TrimSpace(value), []byte("null"))
+}
+
+// positiveIntToken parses a raw JSON scalar and reports the value only when it
+// is an integer >= 1 that fits int64 (no sign, decimal point, or exponent).
+func positiveIntToken(value []byte) (int64, bool) {
+	s := strings.TrimSpace(string(value))
+	if s == "" {
+		return 0, false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
 }
 
 func injectStreamUsage(raw []byte) ([]byte, error) {
@@ -385,12 +417,17 @@ func isLocalOnly(provider *ProviderDirective) bool {
 	if provider == nil || len(provider.Only) == 0 {
 		return false
 	}
+	sawLocal := false
 	for _, value := range provider.Only {
+		if strings.TrimSpace(value) == "" {
+			continue // ignore junk entries (e.g. a serializer trailing comma)
+		}
 		if !localEntry(value) {
 			return false
 		}
+		sawLocal = true
 	}
-	return true
+	return sawLocal
 }
 
 func localPinned(view RequestView) bool {

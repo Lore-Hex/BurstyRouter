@@ -249,6 +249,20 @@ func TestDecideNormalizationEdgeCases(t *testing.T) {
 			localBody: []byte(`{"model":"x","messages":[]}`),
 		},
 		{
+			name:      "provider only local with junk empty entry stays a local pin",
+			raw:       []byte(`{"model":"anthropic/claude","provider":{"only":["local",""]},"messages":[]}`),
+			route:     RouteLocal,
+			reason:    ReasonForced,
+			localBody: []byte(`{"model":"anthropic/claude","messages":[]}`),
+		},
+		{
+			name:      "provider only all-empty is not a local pin",
+			raw:       []byte(`{"model":"llama3","provider":{"only":["",""]},"messages":[]}`),
+			route:     RouteLocal,
+			reason:    ReasonPolicy,
+			localBody: []byte(`{"model":"llama3","messages":[]}`),
+		},
+		{
 			name:   "provider order comma-string names external",
 			raw:    []byte(`{"model":"trustedrouter/auto","provider":{"order":"local,anthropic"},"messages":[]}`),
 			route:  RouteTrustedRouter,
@@ -331,6 +345,31 @@ func TestDecideFoldsMaxTokensAliasesIntoLocalBody(t *testing.T) {
 			name:      "non-numeric alias is not folded",
 			raw:       []byte(`{"model":"local/qwen","max_completion_tokens":null,"messages":[]}`),
 			localBody: []byte(`{"model":"qwen","max_completion_tokens":null,"messages":[]}`),
+		},
+		{
+			name:      "null max_tokens does not block the fold",
+			raw:       []byte(`{"model":"local/qwen","max_tokens":null,"max_completion_tokens":256,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_completion_tokens":256,"messages":[],"max_tokens":256}`),
+		},
+		{
+			name:      "float alias is not folded",
+			raw:       []byte(`{"model":"local/qwen","max_completion_tokens":256.5,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_completion_tokens":256.5,"messages":[]}`),
+		},
+		{
+			name:      "exponent alias is not folded",
+			raw:       []byte(`{"model":"local/qwen","max_output_tokens":1e5,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_output_tokens":1e5,"messages":[]}`),
+		},
+		{
+			name:      "overflow alias is not folded",
+			raw:       []byte(`{"model":"local/qwen","max_completion_tokens":99999999999999999999,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_completion_tokens":99999999999999999999,"messages":[]}`),
+		},
+		{
+			name:      "zero alias is not folded",
+			raw:       []byte(`{"model":"local/qwen","max_completion_tokens":0,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_completion_tokens":0,"messages":[]}`),
 		},
 	}
 
