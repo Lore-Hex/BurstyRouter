@@ -195,8 +195,9 @@ func mapOpenAIFinishReason(reason string) string {
 	case "tool_calls":
 		return "tool_use"
 	case "content_filter":
-		logOnce("finish_reason:content_filter", "bursty anthropic: mapping OpenAI content_filter finish_reason to Anthropic end_turn")
-		return "end_turn"
+		// "refusal" is the Anthropic-valid stop_reason for a filtered/blocked
+		// turn (matches the enclave); mapping to end_turn would hide the stop.
+		return "refusal"
 	default:
 		return "end_turn"
 	}

@@ -63,6 +63,84 @@ func TestTranslateRequestGolden(t *testing.T) {
 	assertJSONEqual(t, got, want)
 }
 
+func TestTranslateRequestForwardsTopKAndThinking(t *testing.T) {
+	raw := []byte(`{
+		"model":"qwen3",
+		"max_tokens":100,
+		"top_k":40,
+		"thinking":{"type":"enabled","budget_tokens":2048},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest() error = %v", err)
+	}
+	want := []byte(`{
+		"model":"qwen3",
+		"messages":[{"role":"user","content":"hi"}],
+		"max_tokens":100,
+		"top_k":40,
+		"reasoning_effort":"medium",
+		"stream":false
+	}`)
+	assertJSONEqual(t, got, want)
+}
+
+func TestReasoningEffortFromThinking(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{``, ""},
+		{`null`, ""},
+		{`{"type":"disabled"}`, ""},
+		{`{"type":"enabled","budget_tokens":512}`, "low"},
+		{`{"type":"enabled","budget_tokens":1024}`, "low"},
+		{`{"type":"enabled","budget_tokens":2048}`, "medium"},
+		{`{"type":"enabled","budget_tokens":4096}`, "medium"},
+		{`{"type":"enabled","budget_tokens":16000}`, "high"},
+		{`{"type":"enabled"}`, "medium"},
+		{`{"budget_tokens":900}`, "low"},
+	}
+	for _, c := range cases {
+		if got := reasoningEffortFromThinking([]byte(c.in)); got != c.want {
+			t.Fatalf("reasoningEffortFromThinking(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestTranslateContentFilterMapsToRefusal(t *testing.T) {
+	t.Run("non-stream", func(t *testing.T) {
+		raw := []byte(`{"model":"m","choices":[{"message":{"content":"blocked"},"finish_reason":"content_filter"}]}`)
+		got, _, err := TranslateResponse(raw, "visible")
+		if err != nil {
+			t.Fatalf("TranslateResponse() error = %v", err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(got, &out); err != nil {
+			t.Fatalf("invalid JSON: %v\n%s", err, got)
+		}
+		if out["stop_reason"] != "refusal" {
+			t.Fatalf("stop_reason = %v, want refusal", out["stop_reason"])
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		input := strings.Join([]string{
+			`data: {"choices":[{"delta":{"content":"blocked"},"finish_reason":"content_filter"}]}`,
+			`data: [DONE]`,
+			``,
+		}, "\n\n")
+		var out bytes.Buffer
+		if _, err := TranslateStream(strings.NewReader(input), &out, "visible"); err != nil {
+			t.Fatalf("TranslateStream() error = %v\n%s", err, out.String())
+		}
+		if got := stopReason(t, parseSSEEvents(t, out.String())); got != "refusal" {
+			t.Fatalf("stream stop_reason = %q, want refusal", got)
+		}
+	})
+}
+
 func TestTranslateRequestToolChoiceAndArguments(t *testing.T) {
 	tests := []struct {
 		name          string

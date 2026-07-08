@@ -298,6 +298,10 @@ func localForwardBody(raw []byte, view RequestView, aliasTarget string) ([]byte,
 			return nil, err
 		}
 	}
+	body, err = normalizeMaxTokens(body)
+	if err != nil {
+		return nil, err
+	}
 	if view.Stream {
 		body, err = injectStreamUsage(body)
 		if err != nil {
@@ -305,6 +309,29 @@ func localForwardBody(raw []byte, view RequestView, aliasTarget string) ([]byte,
 		}
 	}
 	return body, nil
+}
+
+// normalizeMaxTokens folds OpenAI's max_completion_tokens / max_output_tokens
+// spellings into a top-level max_tokens for local servers that only read
+// max_tokens, mirroring the enclave. An explicit max_tokens always wins, and
+// only a positive-integer alias value is folded.
+func normalizeMaxTokens(raw []byte) ([]byte, error) {
+	if _, ok, err := topLevelRawValue(raw, "max_tokens"); err != nil {
+		return nil, err
+	} else if ok {
+		return raw, nil
+	}
+	for _, key := range []string{"max_completion_tokens", "max_output_tokens"} {
+		value, ok, err := topLevelRawValue(raw, key)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || len(value) == 0 || value[0] < '0' || value[0] > '9' {
+			continue
+		}
+		return InjectTopLevelObject(raw, "max_tokens", value)
+	}
+	return raw, nil
 }
 
 func injectStreamUsage(raw []byte) ([]byte, error) {

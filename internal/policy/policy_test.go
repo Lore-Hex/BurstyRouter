@@ -304,6 +304,48 @@ func TestDecideNormalizationEdgeCases(t *testing.T) {
 	}
 }
 
+func TestDecideFoldsMaxTokensAliasesIntoLocalBody(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		raw       []byte
+		localBody []byte
+	}{
+		{
+			name:      "max_completion_tokens folded",
+			raw:       []byte(`{"model":"local/qwen","max_completion_tokens":256,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_completion_tokens":256,"messages":[],"max_tokens":256}`),
+		},
+		{
+			name:      "max_output_tokens folded",
+			raw:       []byte(`{"model":"local/qwen","max_output_tokens":128,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_output_tokens":128,"messages":[],"max_tokens":128}`),
+		},
+		{
+			name:      "explicit max_tokens wins",
+			raw:       []byte(`{"model":"local/qwen","max_tokens":64,"max_completion_tokens":256,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_tokens":64,"max_completion_tokens":256,"messages":[]}`),
+		},
+		{
+			name:      "non-numeric alias is not folded",
+			raw:       []byte(`{"model":"local/qwen","max_completion_tokens":null,"messages":[]}`),
+			localBody: []byte(`{"model":"qwen","max_completion_tokens":null,"messages":[]}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Decide(tt.raw, true, true)
+			if err != nil {
+				t.Fatalf("Decide() error = %v", err)
+			}
+			assertJSONEqual(t, got.LocalBody, tt.localBody)
+		})
+	}
+}
+
 func TestDecideRejectsEmptyLocalPrefix(t *testing.T) {
 	t.Parallel()
 

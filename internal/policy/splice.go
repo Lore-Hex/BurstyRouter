@@ -115,6 +115,21 @@ func InjectTopLevelObject(raw []byte, key string, objectValue []byte) ([]byte, e
 	return out, nil
 }
 
+// topLevelRawValue returns the raw JSON bytes of a top-level member's value and
+// whether the key is present. Nested keys with the same name are ignored.
+func topLevelRawValue(raw []byte, key string) ([]byte, bool, error) {
+	scan, err := scanTopLevelObject(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, member := range scan.members {
+		if member.key == key {
+			return raw[member.valueStart:member.valueEnd], true, nil
+		}
+	}
+	return nil, false, nil
+}
+
 func scanTopLevelObject(raw []byte) (objectScan, error) {
 	i := skipWhitespace(raw, 0)
 	if i >= len(raw) || raw[i] != '{' {
