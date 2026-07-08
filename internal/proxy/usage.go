@@ -97,7 +97,9 @@ func (s *streamUsageScanner) processLine(line []byte) {
 		return
 	}
 	capture := extractUsageAndModel(data)
-	if capture.HasUsage {
+	// Latch only positive counts so a trailing usage:{0,0} chunk cannot zero out
+	// the true totals captured from the last content chunk.
+	if capture.HasUsage && (capture.Usage.PromptTokens > 0 || capture.Usage.CompletionTokens > 0) {
 		s.seen = capture
 	}
 }

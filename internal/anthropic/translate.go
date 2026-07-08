@@ -45,7 +45,9 @@ type anthropicRequest struct {
 	MaxTokens     *int               `json:"max_tokens"`
 	Temperature   *float64           `json:"temperature"`
 	TopP          *float64           `json:"top_p"`
+	TopK          *int               `json:"top_k"`
 	StopSequences []string           `json:"stop_sequences"`
+	Thinking      json.RawMessage    `json:"thinking"`
 	Stream        bool               `json:"stream"`
 }
 
@@ -72,16 +74,18 @@ type contentBlock struct {
 }
 
 type openAIChatRequest struct {
-	Model         string          `json:"model"`
-	Messages      []openAIMessage `json:"messages"`
-	Tools         []openAITool    `json:"tools,omitempty"`
-	ToolChoice    any             `json:"tool_choice,omitempty"`
-	MaxTokens     int             `json:"max_tokens"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	Stop          []string        `json:"stop,omitempty"`
-	Stream        bool            `json:"stream"`
-	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []openAIMessage `json:"messages"`
+	Tools           []openAITool    `json:"tools,omitempty"`
+	ToolChoice      any             `json:"tool_choice,omitempty"`
+	MaxTokens       int             `json:"max_tokens"`
+	Temperature     *float64        `json:"temperature,omitempty"`
+	TopP            *float64        `json:"top_p,omitempty"`
+	TopK            *int            `json:"top_k,omitempty"`
+	Stop            []string        `json:"stop,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Stream          bool            `json:"stream"`
+	StreamOptions   *streamOptions  `json:"stream_options,omitempty"`
 }
 
 type streamOptions struct {
@@ -164,8 +168,12 @@ func TranslateRequest(raw []byte) ([]byte, error) {
 		MaxTokens:   *req.MaxTokens,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
+		TopK:        req.TopK,
 		Stop:        req.StopSequences,
 		Stream:      req.Stream,
+	}
+	if effort := reasoningEffortFromThinking(req.Thinking); effort != "" {
+		out.ReasoningEffort = effort
 	}
 	if req.Stream {
 		out.StreamOptions = &streamOptions{IncludeUsage: true}
@@ -417,6 +425,49 @@ func toolResultText(content any) (string, error) {
 	}
 }
 
+// reasoningEffortFromThinking maps an Anthropic extended-thinking directive to
+// an OpenAI reasoning_effort string so local servers that honor it (vLLM/SGLang
+// reasoning models) receive the hint. Budget thresholds mirror the enclave's
+// effort buckets (low<=1024, medium<=4096, high above). Disabled or absent
+// thinking yields no hint; servers that ignore reasoning_effort are unaffected.
+func reasoningEffortFromThinking(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return ""
+	}
+	// Capture budget_tokens as raw so a malformed value (string, etc.) does not
+	// fail the whole decode and lose the type directive.
+	var cfg struct {
+		Type         string          `json:"type"`
+		BudgetTokens json.RawMessage `json:"budget_tokens"`
+	}
+	if err := decodeUseNumber(raw, &cfg); err != nil {
+		return ""
+	}
+	if cfg.Type != "" && !strings.EqualFold(cfg.Type, "enabled") {
+		return ""
+	}
+	// Parse as float so a huge or overflowing budget still buckets as "high"
+	// rather than falling through to the enabled-default.
+	if len(bytes.TrimSpace(cfg.BudgetTokens)) > 0 {
+		var budget float64
+		if err := json.Unmarshal(cfg.BudgetTokens, &budget); err == nil && budget > 0 {
+			switch {
+			case budget <= 1024:
+				return "low"
+			case budget <= 4096:
+				return "medium"
+			default:
+				return "high"
+			}
+		}
+	}
+	// Enabled with no usable budget → neutral default; otherwise no hint.
+	if strings.EqualFold(cfg.Type, "enabled") {
+		return "medium"
+	}
+	return ""
+}
+
 func translateToolChoice(raw json.RawMessage) (any, error) {
 	var choice struct {
 		Type string `json:"type"`
@@ -455,6 +506,7 @@ func logDroppedTopLevelFields(fields map[string]json.RawMessage) {
 		"max_tokens":        {},
 		"temperature":       {},
 		"top_p":             {},
+		"top_k":             {},
 		"stop_sequences":    {},
 		"stream":            {},
 		"stream_options":    {},
@@ -471,7 +523,7 @@ func logDroppedTopLevelFields(fields map[string]json.RawMessage) {
 	for _, key := range keys {
 		if _, ok := known[key]; ok {
 			switch key {
-			case "anthropic_version", "metadata", "thinking":
+			case "anthropic_version", "metadata":
 				logOnce("top:"+key, fmt.Sprintf("bursty anthropic: dropping %s on local /v1/messages path", key))
 			}
 			continue

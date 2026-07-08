@@ -5,7 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
+
+// isRewrittenKey reports whether key (already lowercased) is a top-level key
+// BurstyRouter reads for routing or rewrites in the forwarded body, and so must
+// appear at most once in canonical lowercase form.
+func isRewrittenKey(key string) bool {
+	switch key {
+	case "model", "provider", "max_tokens", "max_completion_tokens", "max_output_tokens", "stream", "stream_options":
+		return true
+	default:
+		return false
+	}
+}
 
 type objectMember struct {
 	key         string
@@ -82,8 +95,9 @@ func ReplaceTopLevelString(raw []byte, key, value string) ([]byte, error) {
 	return nil, fmt.Errorf("top-level key %q not found", key)
 }
 
-// InjectTopLevelObject inserts or replaces a top-level object member with an
-// already-encoded JSON object value.
+// InjectTopLevelObject inserts or replaces a top-level member with an
+// already-encoded JSON value (an object, or any valid scalar such as a number).
+// Any existing member with the same key is removed first.
 func InjectTopLevelObject(raw []byte, key string, objectValue []byte) ([]byte, error) {
 	if !json.Valid(objectValue) {
 		return nil, errors.New("injected value is not valid JSON")
@@ -115,6 +129,21 @@ func InjectTopLevelObject(raw []byte, key string, objectValue []byte) ([]byte, e
 	return out, nil
 }
 
+// topLevelRawValue returns the raw JSON bytes of a top-level member's value and
+// whether the key is present. Nested keys with the same name are ignored.
+func topLevelRawValue(raw []byte, key string) ([]byte, bool, error) {
+	scan, err := scanTopLevelObject(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, member := range scan.members {
+		if member.key == key {
+			return raw[member.valueStart:member.valueEnd], true, nil
+		}
+	}
+	return nil, false, nil
+}
+
 func scanTopLevelObject(raw []byte) (objectScan, error) {
 	i := skipWhitespace(raw, 0)
 	if i >= len(raw) || raw[i] != '{' {
@@ -122,7 +151,7 @@ func scanTopLevelObject(raw []byte) (objectScan, error) {
 	}
 	i++
 	var members []objectMember
-	seenRoutingKeys := map[string]struct{}{}
+	seenUniqueKeys := map[string]struct{}{}
 	for {
 		i = skipWhitespace(raw, i)
 		if i >= len(raw) {
@@ -148,11 +177,21 @@ func scanTopLevelObject(raw []byte) (objectScan, error) {
 		if err := json.Unmarshal(raw[i:keyEnd], &key); err != nil {
 			return objectScan{}, err
 		}
-		if key == "model" || key == "provider" {
-			if _, ok := seenRoutingKeys[key]; ok {
+		// For the top-level keys BurstyRouter reads or rewrites, require exactly one
+		// occurrence in canonical lowercase form. encoding/json matches struct
+		// fields case-insensitively and takes the last duplicate, whereas our raw
+		// splicing is exact-case and takes the first — so a non-canonical-case or
+		// duplicate key would let the routing decision and the body rewrite
+		// disagree and corrupt the forwarded request. Such malformed input is
+		// refused rather than mishandled.
+		if lower := strings.ToLower(key); isRewrittenKey(lower) {
+			if key != lower {
+				return objectScan{}, fmt.Errorf("non-canonical top-level key %q (use %q)", key, lower)
+			}
+			if _, ok := seenUniqueKeys[lower]; ok {
 				return objectScan{}, fmt.Errorf("duplicate top-level key %q", key)
 			}
-			seenRoutingKeys[key] = struct{}{}
+			seenUniqueKeys[lower] = struct{}{}
 		}
 		i = skipWhitespace(raw, keyEnd)
 		if i >= len(raw) || raw[i] != ':' {
