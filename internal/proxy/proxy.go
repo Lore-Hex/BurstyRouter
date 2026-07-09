@@ -73,18 +73,19 @@ type SavingsTotals struct {
 
 // Server is the BurstyRouter HTTP proxy.
 type Server struct {
-	cfg        config.Config
-	local      *upstream.Local
-	tr         *upstream.TrustedRouter
-	localSlots chan struct{}
-	stats      *stats
-	models     modelsCache
-	catalog    *http.Client
-	savings    *savingsMeter
-	cloud      *cloudControl
-	logStop    chan struct{}
-	logDone    chan struct{}
-	closeOnce  sync.Once
+	cfg            config.Config
+	local          *upstream.Local
+	tr             *upstream.TrustedRouter
+	localSlots     chan struct{}
+	stats          *stats
+	models         modelsCache
+	catalog        *http.Client
+	savings        *savingsMeter
+	cloud          *cloudControl
+	warmRetryDelay time.Duration
+	logStop        chan struct{}
+	logDone        chan struct{}
+	closeOnce      sync.Once
 }
 
 // New builds a configured proxy server.
@@ -118,20 +119,46 @@ func New(cfg config.Config) (*Server, error) {
 		slots = make(chan struct{}, cfg.LocalMaxConcurrency)
 	}
 	server := &Server{
-		cfg:        cfg,
-		local:      local,
-		tr:         tr,
-		localSlots: slots,
-		stats:      newStats(),
-		catalog:    &http.Client{Timeout: catalogTimeout},
-		savings:    newSavingsMeter(cfg.StateFile),
-		cloud:      newCloudControl(cfg.Cloud),
-		logStop:    make(chan struct{}),
-		logDone:    make(chan struct{}),
+		cfg:            cfg,
+		local:          local,
+		tr:             tr,
+		localSlots:     slots,
+		stats:          newStats(),
+		catalog:        &http.Client{Timeout: catalogTimeout},
+		savings:        newSavingsMeter(cfg.StateFile),
+		cloud:          newCloudControl(cfg.Cloud),
+		warmRetryDelay: 2 * time.Second,
+		logStop:        make(chan struct{}),
+		logDone:        make(chan struct{}),
 	}
 	server.logSavingsSummary()
 	go server.savingsLogLoop()
 	return server, nil
+}
+
+// WarmPricingCatalog fetches the TrustedRouter catalog once (with one retry)
+// so the savings meter can price the very first request after startup instead
+// of recording it unpriced while the cache is cold. It is a no-op unless
+// pricing is actually configured (a savings reference or model aliases).
+// Callers run it in a goroutine; it is not started inside New so tests can
+// swap the catalog client without racing a background fetch.
+func (s *Server) WarmPricingCatalog() {
+	if s.cfg.SavingsReference == "" && len(s.cfg.Aliases) == 0 {
+		return
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), catalogTimeout)
+		_, err := s.cachedTrustedRouterModels(ctx)
+		cancel()
+		if err == nil {
+			return
+		}
+		if attempt == 0 {
+			time.Sleep(s.warmRetryDelay)
+			continue
+		}
+		log.Printf("bursty savings: pricing catalog warm failed: %v", err)
+	}
 }
 
 // ServeHTTP implements http.Handler.

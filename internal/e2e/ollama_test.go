@@ -183,8 +183,8 @@ func TestRealOllamaSlowFirstByteHedges(t *testing.T) {
 	if !strings.Contains(string(body), "data: tr") {
 		t.Fatalf("body = %q, want TrustedRouter stream", body)
 	}
-	if trLog.count() != 1 {
-		t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+	if trLog.countPath("/v1/chat/completions") != 1 {
+		t.Fatalf("trustedrouter chat calls = %d, want 1", trLog.countPath("/v1/chat/completions"))
 	}
 }
 

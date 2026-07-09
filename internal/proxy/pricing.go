@@ -59,7 +59,13 @@ func (s *Server) catalogPrice(ctx context.Context, model string) (priceQuote, bo
 	if model == "" {
 		return priceQuote{}, false
 	}
-	models, err := s.cachedTrustedRouterModels(ctx)
+	// Pricing runs after the response has been served, when the request context
+	// is often already canceled (the client is gone). Detach from cancellation
+	// so the catalog fetch still succeeds, with its own timeout so a record can
+	// never hang the handler.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), catalogTimeout)
+	defer cancel()
+	models, err := s.cachedTrustedRouterModels(fetchCtx)
 	if err != nil {
 		return priceQuote{}, false
 	}

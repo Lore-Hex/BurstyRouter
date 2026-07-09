@@ -2692,6 +2692,142 @@ func TestStreamingLocalUsageSavingsAndStreamOptions(t *testing.T) {
 	}
 }
 
+func TestCatalogPriceSurvivesCanceledRequestContext(t *testing.T) {
+	t.Parallel()
+
+	// Pricing happens after the response is served, when the request context is
+	// often already canceled. With a COLD cache the catalog fetch must still
+	// succeed (detached context), or the first request records unpriced.
+	catalog := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"data": []map[string]any{
+				{"id": "openai/gpt-4o", "pricing": map[string]any{"prompt": "0.000001", "completion": "0.000002"}},
+			},
+		})
+	})
+	proxy := newProxyWithHandlers(t, config.Config{
+		TRCatalogURL: "http://catalog.test/v1",
+		BurstOnError: true,
+	}, nil, nil)
+	proxy.catalog = &http.Client{Transport: handlerTransport{handler: catalog}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the client is gone before pricing runs
+
+	quote := proxy.localSavingsPrice(ctx, policy.Decision{
+		AliasKey: "openai/gpt-4o",
+		View:     policy.RequestView{Model: "openai/gpt-4o"},
+	})
+	if !quote.Priced || quote.Reference != "openai/gpt-4o" {
+		t.Fatalf("quote = %+v, want priced via openai/gpt-4o despite canceled context", quote)
+	}
+}
+
+func TestWarmPricingCatalog(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no-op without pricing config", func(t *testing.T) {
+		t.Parallel()
+		var hits atomic.Int64
+		catalog := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			writeTestJSON(w, http.StatusOK, map[string]any{"data": []map[string]any{}})
+		})
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRCatalogURL: "http://catalog.test/v1",
+			BurstOnError: true,
+		}, nil, nil)
+		proxy.catalog = &http.Client{Transport: handlerTransport{handler: catalog}}
+		proxy.WarmPricingCatalog()
+		if hits.Load() != 0 {
+			t.Fatalf("catalog hits = %d, want 0 (no savings reference or aliases)", hits.Load())
+		}
+	})
+
+	t.Run("retries once then caches", func(t *testing.T) {
+		t.Parallel()
+		var hits atomic.Int64
+		catalog := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if hits.Add(1) == 1 {
+				writeTestJSON(w, http.StatusInternalServerError, map[string]any{"error": "catalog down"})
+				return
+			}
+			writeTestJSON(w, http.StatusOK, map[string]any{
+				"data": []map[string]any{
+					{"id": "openai/ref", "pricing": map[string]any{"prompt": "0.000001", "completion": "0.000002"}},
+				},
+			})
+		})
+		proxy := newProxyWithHandlers(t, config.Config{
+			TRCatalogURL:     "http://catalog.test/v1",
+			BurstOnError:     true,
+			SavingsReference: "openai/ref",
+		}, nil, nil)
+		proxy.catalog = &http.Client{Transport: handlerTransport{handler: catalog}}
+		proxy.warmRetryDelay = 10 * time.Millisecond
+
+		proxy.WarmPricingCatalog()
+		if hits.Load() != 2 {
+			t.Fatalf("catalog hits = %d, want 2 (fail then retry)", hits.Load())
+		}
+
+		// The warm result must serve pricing from cache: no further fetches.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		quote := proxy.localSavingsPrice(ctx, policy.Decision{View: policy.RequestView{Model: "local-native"}})
+		if !quote.Priced || quote.Reference != "openai/ref" {
+			t.Fatalf("quote = %+v, want priced via openai/ref from warm cache", quote)
+		}
+		if hits.Load() != 2 {
+			t.Fatalf("catalog hits after pricing = %d, want 2 (cache hit)", hits.Load())
+		}
+	})
+}
+
+func TestFirstRequestAfterStartupIsPriced(t *testing.T) {
+	// Regression: the very first chat request after startup, with a COLD
+	// catalog cache (no /v1/models warm-up call), must still be priced.
+	local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"model\":\"llama3\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+	catalog := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"data": []map[string]any{
+				{"id": "openai/gpt-4o", "pricing": map[string]any{"prompt": "0.000001", "completion": "0.000002"}},
+			},
+		})
+	})
+	proxy := newProxyWithHandlers(t, config.Config{
+		TRCatalogURL: "http://catalog.test/v1",
+		BurstOnError: true,
+		Aliases:      map[string]string{"openai/gpt-4o": "llama3"},
+	}, local, nil)
+	proxy.catalog = &http.Client{Transport: handlerTransport{handler: catalog}}
+
+	resp, body := postChat(t, proxy, `{"model":"openai/gpt-4o","stream":true,"messages":[]}`, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	statsResp, statsBody := get(t, proxy, "/stats", "")
+	if statsResp.StatusCode != http.StatusOK {
+		t.Fatalf("stats status = %d body=%s", statsResp.StatusCode, statsBody)
+	}
+	var statsPayload struct {
+		Savings struct {
+			SavedUSD   float64          `json:"saved_usd"`
+			References map[string]int64 `json:"references"`
+		} `json:"savings"`
+	}
+	if err := json.Unmarshal(statsBody, &statsPayload); err != nil {
+		t.Fatalf("stats JSON: %v\n%s", err, statsBody)
+	}
+	if statsPayload.Savings.SavedUSD <= 0 || statsPayload.Savings.References["openai/gpt-4o"] != 1 {
+		t.Fatalf("first request was not priced: %#v body=%s", statsPayload.Savings, statsBody)
+	}
+}
+
 func TestStreamUsageUnknownAndTokensOnly(t *testing.T) {
 	local := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
