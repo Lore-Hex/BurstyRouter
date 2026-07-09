@@ -33,6 +33,8 @@ const (
 	envStateFile           = "BURSTY_STATE_FILE"
 	envCloud               = "BURSTY_CLOUD"
 	envMaxCloudSpend       = "BURSTY_MAX_CLOUD_SPEND"
+	envSSEBatchWindow      = "BURSTY_SSE_BATCH_WINDOW"
+	envSSEBatchMaxBytes    = "BURSTY_SSE_BATCH_MAX_BYTES"
 )
 
 // DefaultTRCatalogURL is the public TrustedRouter control-plane catalog base URL.
@@ -65,6 +67,8 @@ type Config struct {
 	StateFile           string
 	Cloud               CloudMode
 	MaxCloudSpendMicro  int64
+	SSEBatchWindow      time.Duration
+	SSEBatchMaxBytes    int
 	NoAutodetect        bool
 	PrintVersion        bool
 }
@@ -105,6 +109,8 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 	fs.StringVar(&cfg.StateFile, "state-file", cfg.StateFile, "state file path; empty disables persistence")
 	fs.Var(cloudModeValue{value: &cfg.Cloud}, "cloud", "cloud egress mode: auto, explicit, or off")
 	fs.Var(usdMicroValue{value: &cfg.MaxCloudSpendMicro}, "max-cloud-spend", "maximum cloud spend in USD per UTC day; 0 disables the cap")
+	fs.DurationVar(&cfg.SSEBatchWindow, "sse-batch-window", cfg.SSEBatchWindow, "coalesce streamed chat SSE content chunks within this window to cut egress bytes (useful when exposed over ngrok/WAN); 0 disables")
+	fs.IntVar(&cfg.SSEBatchMaxBytes, "sse-batch-max-bytes", cfg.SSEBatchMaxBytes, "max buffered content bytes before a coalesced SSE chunk is flushed")
 	fs.BoolVar(&cfg.NoAutodetect, "no-autodetect", cfg.NoAutodetect, "disable local server autodetection when -local-url is unset")
 	fs.BoolVar(&cfg.PrintVersion, "version", cfg.PrintVersion, "print version and exit")
 	fs.Usage = func() {
@@ -127,6 +133,8 @@ func Parse(args []string, lookupEnv func(string) (string, bool), output io.Write
 		fmt.Fprintln(output, "  -state-file                env BURSTY_STATE_FILE              default $XDG_STATE_HOME/bursty/state.json or ~/.bursty/state.json")
 		fmt.Fprintln(output, "  -cloud                     env BURSTY_CLOUD                   default auto")
 		fmt.Fprintln(output, "  -max-cloud-spend           env BURSTY_MAX_CLOUD_SPEND         default 0")
+		fmt.Fprintln(output, "  -sse-batch-window          env BURSTY_SSE_BATCH_WINDOW        default 0s")
+		fmt.Fprintln(output, "  -sse-batch-max-bytes       env BURSTY_SSE_BATCH_MAX_BYTES     default 4096")
 		fmt.Fprintln(output, "  -no-autodetect             env none                           default false")
 		fmt.Fprintln(output, "  -version                   env none                           default false")
 	}
@@ -150,6 +158,7 @@ func defaultsFromEnv(lookupEnv func(string) (string, bool)) (Config, error) {
 		Aliases:             map[string]string{},
 		StateFile:           defaultStateFile(lookupEnv),
 		Cloud:               CloudAuto,
+		SSEBatchMaxBytes:    4096,
 	}
 
 	if value, ok := lookupEnv(envListen); ok {
@@ -187,6 +196,20 @@ func defaultsFromEnv(lookupEnv func(string) (string, bool)) (Config, error) {
 			return Config{}, fmt.Errorf("%s: %w", envLocalSlowAfter, err)
 		}
 		cfg.LocalSlowAfter = parsed
+	}
+	if value, ok := lookupEnv(envSSEBatchWindow); ok {
+		parsed, err := time.ParseDuration(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %w", envSSEBatchWindow, err)
+		}
+		cfg.SSEBatchWindow = parsed
+	}
+	if value, ok := lookupEnv(envSSEBatchMaxBytes); ok {
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %w", envSSEBatchMaxBytes, err)
+		}
+		cfg.SSEBatchMaxBytes = parsed
 	}
 	if value, ok := lookupEnv(envBurstOnError); ok {
 		parsed, err := strconv.ParseBool(strings.TrimSpace(value))

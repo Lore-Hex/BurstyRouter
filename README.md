@@ -66,6 +66,8 @@ You stay in control of *whether* traffic leaves at all — see [Cloud Controls](
 | `-state-file` | `BURSTY_STATE_FILE` | `$XDG_STATE_HOME/bursty/state.json` or `~/.bursty/state.json`; `""` disables |
 | `-cloud` | `BURSTY_CLOUD` | `auto` |
 | `-max-cloud-spend` | `BURSTY_MAX_CLOUD_SPEND` | `0` |
+| `-sse-batch-window` | `BURSTY_SSE_BATCH_WINDOW` | `0s` |
+| `-sse-batch-max-bytes` | `BURSTY_SSE_BATCH_MAX_BYTES` | `4096` |
 | `-no-autodetect` | none | `false` |
 | `-version` | none | `false` |
 | `-token` | `BURSTY_TOKEN` | `""` |
@@ -73,6 +75,8 @@ You stay in control of *whether* traffic leaves at all — see [Cloud Controls](
 When `-local-url` is unset, BurstyRouter probes `OLLAMA_HOST`, Ollama, LM Studio, llama.cpp, and vLLM on common localhost ports. If no local server is found, `TRUSTEDROUTER_API_KEY` enables pure cloud passthrough; without either, startup prints an actionable error. Use `-no-autodetect` to disable local probing. Set `BURSTY_TOKEN` whenever the proxy is reachable outside localhost. Auth accepts either `Authorization: Bearer <token>` or `x-api-key: <token>`.
 
 Aliases map cloud-facing ids to local model ids. For example, `-alias gpt-4o=qwen2.5-coder:32b` lets tools request `gpt-4o`; local receives `qwen2.5-coder:32b`, while bursts still send `gpt-4o`.
+
+`-sse-batch-window` coalesces streamed chat-completions content chunks to cut egress bytes — each token otherwise spends ~150–250 bytes of SSE/JSON framing on a few bytes of content. It's off by default (zero added latency on localhost); set it (e.g. `-sse-batch-window 40ms`) when BurstyRouter is exposed over ngrok or a WAN, where per-byte egress matters. The first token always flushes immediately so time-to-first-token is unchanged, and reasoning/tool-call frames are never merged.
 
 ## Claude Code On Your GPU
 
