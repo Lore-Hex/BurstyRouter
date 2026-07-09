@@ -232,8 +232,8 @@ func TestBinaryBurstOnFull(t *testing.T) {
 	}
 	assertRoute(t, resp, "trustedrouter", "burst-full")
 	assertBurstyBlock(t, body, "trustedrouter", "burst-full")
-	if trLog.count() != 1 {
-		t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+	if trLog.countPath("/v1/chat/completions") != 1 {
+		t.Fatalf("trustedrouter chat calls = %d, want 1", trLog.countPath("/v1/chat/completions"))
 	}
 
 	release()
@@ -634,8 +634,8 @@ func TestBinaryUnmappedLocalModelSuppressionAndFallback(t *testing.T) {
 			t.Fatalf("status = %d body=%s", resp.StatusCode, body)
 		}
 		assertRoute(t, resp, "local", "burst-full")
-		if trLog.count() != 0 {
-			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 0 {
+			t.Fatalf("trustedrouter chat calls = %d, want 0", trLog.countPath("/v1/chat/completions"))
 		}
 
 		release()
@@ -737,8 +737,8 @@ func TestBinaryBurstOnError(t *testing.T) {
 		}
 		assertRoute(t, resp, "trustedrouter", "burst-error")
 		assertBurstyBlock(t, body, "trustedrouter", "burst-error")
-		if trLog.count() != 1 {
-			t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 1 {
+			t.Fatalf("trustedrouter chat calls = %d, want 1", trLog.countPath("/v1/chat/completions"))
 		}
 	})
 
@@ -764,8 +764,8 @@ func TestBinaryBurstOnError(t *testing.T) {
 		}
 		assertRoute(t, resp, "trustedrouter", "burst-error")
 		assertBurstyBlock(t, body, "trustedrouter", "burst-error")
-		if trLog.count() != 1 {
-			t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 1 {
+			t.Fatalf("trustedrouter chat calls = %d, want 1", trLog.countPath("/v1/chat/completions"))
 		}
 	})
 }
@@ -819,8 +819,8 @@ func TestBinarySlowLocalFirstByte(t *testing.T) {
 		if bytes.Contains(body, []byte("local")) {
 			t.Fatalf("client received local bytes after hedge: %q", body)
 		}
-		if trLog.count() != 1 {
-			t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 1 {
+			t.Fatalf("trustedrouter chat calls = %d, want 1", trLog.countPath("/v1/chat/completions"))
 		}
 		select {
 		case <-localDone:
@@ -873,8 +873,8 @@ func TestBinarySlowLocalFirstByte(t *testing.T) {
 		if bytes.Contains(body, []byte("local")) {
 			t.Fatalf("client received local bytes after hedge: %q", body)
 		}
-		if trLog.count() != 1 {
-			t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 1 {
+			t.Fatalf("trustedrouter chat calls = %d, want 1", trLog.countPath("/v1/chat/completions"))
 		}
 		statsResp, statsBody := get(t, proc, "/stats", nil)
 		if statsResp.StatusCode != http.StatusOK {
@@ -921,8 +921,8 @@ func TestBinarySlowLocalFirstByte(t *testing.T) {
 		if !bytes.Equal(body, []byte("data: local\n\n")) {
 			t.Fatalf("body = %q, want local stream", body)
 		}
-		if trLog.count() != 0 {
-			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 0 {
+			t.Fatalf("trustedrouter chat calls = %d, want 0", trLog.countPath("/v1/chat/completions"))
 		}
 	})
 
@@ -957,8 +957,8 @@ func TestBinarySlowLocalFirstByte(t *testing.T) {
 		}
 		assertRoute(t, resp, "local", "forced")
 		assertBurstyBlock(t, body, "local", "forced")
-		if trLog.count() != 0 {
-			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 0 {
+			t.Fatalf("trustedrouter chat calls = %d, want 0", trLog.countPath("/v1/chat/completions"))
 		}
 	})
 }
@@ -1235,8 +1235,8 @@ func TestBinaryCloudControlsAndBudget(t *testing.T) {
 		if resp.StatusCode != http.StatusTooManyRequests {
 			t.Fatalf("blocked burst status = %d body=%s", resp.StatusCode, body)
 		}
-		if trLog.count() != 0 {
-			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 0 {
+			t.Fatalf("trustedrouter chat calls = %d, want 0", trLog.countPath("/v1/chat/completions"))
 		}
 		close(releaseLocal)
 		if err := <-firstDone; err != nil {
@@ -1247,8 +1247,8 @@ func TestBinaryCloudControlsAndBudget(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("explicit status = %d body=%s", resp.StatusCode, body)
 		}
-		if trLog.count() != 1 {
-			t.Fatalf("trustedrouter calls = %d, want 1", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 1 {
+			t.Fatalf("trustedrouter chat calls = %d, want 1", trLog.countPath("/v1/chat/completions"))
 		}
 	})
 
@@ -1277,8 +1277,8 @@ func TestBinaryCloudControlsAndBudget(t *testing.T) {
 		if !bytes.Contains(body, []byte("cloud disabled by -cloud=off")) {
 			t.Fatalf("body = %s", body)
 		}
-		if trLog.count() != 0 {
-			t.Fatalf("trustedrouter calls = %d, want 0", trLog.count())
+		if trLog.countPath("/v1/chat/completions") != 0 {
+			t.Fatalf("trustedrouter chat calls = %d, want 0", trLog.countPath("/v1/chat/completions"))
 		}
 	})
 
@@ -2235,6 +2235,21 @@ func (l *requestLog) count() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.requests)
+}
+
+// countPath counts recorded requests for one path, so burst assertions are not
+// disturbed by metadata traffic (e.g. the startup pricing-catalog warm fetching
+// /v1/models from the fake TrustedRouter).
+func (l *requestLog) countPath(path string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, r := range l.requests {
+		if r.Path == path {
+			n++
+		}
+	}
+	return n
 }
 
 func (l *requestLog) last(t *testing.T) recordedRequest {

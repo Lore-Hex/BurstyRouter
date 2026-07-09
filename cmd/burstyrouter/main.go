@@ -77,6 +77,7 @@ func main() {
 		log.Fatalf("proxy: %v", err)
 	}
 	defer handler.Close()
+	go handler.WarmPricingCatalog()
 	printBootBanner(os.Stderr, cfg, localInfo, handler.SavingsTotals())
 
 	server := &http.Server{
