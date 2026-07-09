@@ -270,6 +270,9 @@ func validate(cfg Config) error {
 	if cfg.MaxCloudSpendMicro < 0 {
 		return errors.New("-max-cloud-spend must not be negative")
 	}
+	if cfg.SSEBatchWindow < 0 {
+		return errors.New("-sse-batch-window must not be negative")
+	}
 	return nil
 }
 

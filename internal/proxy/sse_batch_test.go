@@ -57,6 +57,11 @@ func reasoningChunk(reasoning string) string {
 		strconv.Quote(reasoning) + `},"finish_reason":null}]}` + "\n\n"
 }
 
+func contentChunkRoleAs(role, content string) string {
+	return `data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":` +
+		strconv.Quote(role) + `,"content":` + strconv.Quote(content) + `},"finish_reason":null}]}` + "\n\n"
+}
+
 const doneEvent = "data: [DONE]\n\n"
 
 // eventContents returns, per SSE event, the chat.completion.chunk delta content
@@ -153,6 +158,33 @@ func TestSSEBatchMergesOllamaRoleDeltas(t *testing.T) {
 	// The merged chunk must keep role:"assistant".
 	if !strings.Contains(out, `"role":"assistant"`) {
 		t.Fatalf("merged chunk dropped role:\n%s", out)
+	}
+}
+
+func TestSSEBatchDoesNotMergeAcrossRoleChange(t *testing.T) {
+	t.Parallel()
+	// A differing role marks a boundary: B (assistant) must not merge with C
+	// (tool), and the tool role must survive.
+	out := runCoalescer(t, 50*time.Millisecond, 4096,
+		contentChunkRoleAs("assistant", "A"), contentChunkRoleAs("assistant", "B"),
+		contentChunkRoleAs("tool", "C"), doneEvent)
+	got := eventContents(t, out)
+	want := []string{"A", "B", "C", "[DONE]"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("events = %v, want %v (B and C must not merge)", got, want)
+	}
+	if !strings.Contains(out, `"role":"tool"`) {
+		t.Fatalf("tool role was dropped:\n%s", out)
+	}
+}
+
+func TestSSEBatchNonStringRolePassesThrough(t *testing.T) {
+	t.Parallel()
+	// A non-string role is not the mergeable shape; the frame relays untouched.
+	weird := `data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":123,"content":"X"},"finish_reason":null}]}` + "\n\n"
+	out := runCoalescer(t, 50*time.Millisecond, 4096, contentChunkRole("A"), weird, doneEvent)
+	if !strings.Contains(out, `"role":123`) {
+		t.Fatalf("non-string role frame was rewritten:\n%s", out)
 	}
 }
 

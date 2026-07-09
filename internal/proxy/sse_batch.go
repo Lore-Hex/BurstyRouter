@@ -298,6 +298,11 @@ func batchChoice(obj map[string]any) (map[string]any, map[string]any, bool) {
 			return nil, nil, false
 		}
 	}
+	if role, ok := delta["role"]; ok {
+		if _, isString := role.(string); !isString {
+			return nil, nil, false
+		}
+	}
 	return choice, delta, true
 }
 
@@ -310,8 +315,26 @@ func mergeBatchEvents(bufferedChoice, bufferedDelta map[string]any, incoming bat
 	if !ok || bufferedIndex != incomingIndex {
 		return false
 	}
+	// Only merge when the role is compatible — both absent, or both the same
+	// string. A differing (or newly appearing) role marks a boundary that must
+	// be preserved, so the caller flushes pending and relays it byte-for-byte.
+	if !sameDeltaRole(bufferedDelta, incoming.delta) {
+		return false
+	}
 	bufferedDelta["content"] = batchContent(bufferedDelta) + batchContent(incoming.delta)
 	return true
+}
+
+func sameDeltaRole(buffered, incoming map[string]any) bool {
+	bufferedRole, bufferedHas := buffered["role"]
+	incomingRole, incomingHas := incoming["role"]
+	if bufferedHas != incomingHas {
+		return false
+	}
+	if !bufferedHas {
+		return true
+	}
+	return bufferedRole == incomingRole
 }
 
 func batchContent(delta map[string]any) string {
