@@ -93,7 +93,7 @@ func TestParseValidationAndUsage(t *testing.T) {
 	if _, err := Parse([]string{"-h"}, envLookup(nil), &usage); err == nil {
 		t.Fatal("Parse(-h) error = nil, want flag.ErrHelp")
 	}
-	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_LOCAL_SLOW_AFTER", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES", "BURSTY_SAVINGS_REFERENCE", "BURSTY_STATE_FILE", "BURSTY_CLOUD", "BURSTY_MAX_CLOUD_SPEND", "-no-autodetect", "-version"} {
+	for _, want := range []string{"-listen", "BURSTY_LOCAL_URL", "TRUSTEDROUTER_API_KEY", "BURSTY_TR_CATALOG_URL", "BURSTY_LOCAL_SLOW_AFTER", "BURSTY_BURST_ON_ERROR", "BURSTY_BURST_FALLBACK_MODEL", "BURSTY_ALIASES", "BURSTY_SAVINGS_REFERENCE", "BURSTY_STATE_FILE", "BURSTY_CLOUD", "BURSTY_MAX_CLOUD_SPEND", "BURSTY_SSE_BATCH_WINDOW", "BURSTY_SSE_BATCH_MAX_BYTES", "-no-autodetect", "-version"} {
 		if !strings.Contains(usage.String(), want) {
 			t.Fatalf("usage missing %q:\n%s", want, usage.String())
 		}
@@ -114,6 +114,9 @@ func TestParseValidationAndUsage(t *testing.T) {
 	}
 	if _, err := Parse([]string{"-local-url", "http://local", "-local-slow-after", "-1s"}, envLookup(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("invalid local slow after error = %v", err)
+	}
+	if _, err := Parse([]string{"-local-url", "http://local", "-sse-batch-window", "-1s"}, envLookup(nil), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("invalid sse batch window error = %v", err)
 	}
 }
 

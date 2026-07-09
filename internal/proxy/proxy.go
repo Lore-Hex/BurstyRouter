@@ -1046,7 +1046,14 @@ func (s *Server) serveUpstreamResponse(w http.ResponseWriter, r *http.Request, r
 	if shouldCaptureUsage(resp) {
 		scanner = &streamUsageScanner{}
 	}
-	streamBody(w, resp, scanner)
+	// Coalescing applies only to OpenAI chat.completions SSE; the shape check in
+	// the coalescer also fails open on anything else, but gating here avoids the
+	// buffering path entirely for other families.
+	batchWindow := time.Duration(0)
+	if endpoint == endpointChatCompletions {
+		batchWindow = s.cfg.SSEBatchWindow
+	}
+	streamBody(w, resp, scanner, batchWindow, s.cfg.SSEBatchMaxBytes)
 	capture := usageCapture{}
 	record := savingsRecord{}
 	if scanner != nil {
@@ -1058,7 +1065,7 @@ func (s *Server) serveUpstreamResponse(w http.ResponseWriter, r *http.Request, r
 	}
 }
 
-func streamBody(w http.ResponseWriter, resp *http.Response, scanner *streamUsageScanner) {
+func streamBody(w http.ResponseWriter, resp *http.Response, scanner *streamUsageScanner, batchWindow time.Duration, batchMaxBytes int) {
 	flusher, _ := w.(http.Flusher)
 	w.WriteHeader(resp.StatusCode)
 	if flusher != nil {
@@ -1069,7 +1076,12 @@ func streamBody(w http.ResponseWriter, resp *http.Response, scanner *streamUsage
 	if scanner != nil {
 		writer = usageScanningWriter{dst: writer, scanner: scanner}
 	}
-	_, _ = io.CopyBuffer(writer, resp.Body, buf)
+	// The coalescer sits closest to the source so the usage scanner still sees
+	// the (non-mergeable) usage chunk intact. A zero window makes it a
+	// transparent pass-through.
+	coalescer := newSSEBatchWriter(writer, batchWindow, batchMaxBytes)
+	_, _ = io.CopyBuffer(coalescer, resp.Body, buf)
+	_ = coalescer.Close()
 }
 
 type flushWriter struct {
